@@ -1,13 +1,3 @@
-""" import chardet, concurrent.futures, csv, gc, glob, hashlib, itertools, logging, os, pandas as pd, re, requests, shutil, sys, textwrap, threading, time, urllib.request, urllib.error, zipfile
-from bs4 import BeautifulSoup
-from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
-from datetime import datetime, timedelta
-from queue import PriorityQueue, Empty, Queue
-from tqdm import tqdm
-from threading import Lock
-from zipfile import ZipFile
-from pathlib import Path
- """
 import concurrent.futures, csv, gc, glob, hashlib, importlib, itertools, logging, os, platform, re, shutil, subprocess, sys, textwrap, threading, time, urllib.request, urllib.error, zipfile
 from datetime import datetime, timedelta
 from queue import PriorityQueue, Empty, Queue
@@ -16,6 +6,7 @@ from zipfile import ZipFile
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 from urllib.error import HTTPError, URLError
+from lxml import etree
 
 # Native Python modulesss
 native_modules = [
@@ -41,9 +32,13 @@ EQUITY_SOURCE_DIR = os.path.join(ROOT_DIR, "EQUITY")
 CFTC_EQUITY_SOURCE_DIR = os.path.join(ROOT_DIR, "CFTC_EQ")
 CFTC_CREDIT_SOURCE_DIR = os.path.join(ROOT_DIR, "CFTC_CR")
 CFTC_COMMODITIES_SOURCE_DIR = os.path.join(ROOT_DIR, "CFTC_CO")
+CFTC_FOREX_SOURCE_DIR = os.path.join(ROOT_DIR, "FOREX")
+CFTC_RATES_SOURCE_DIR = os.path.join(ROOT_DIR, "CFTC_IR")
 EDGAR_SOURCE_DIR = os.path.join(ROOT_DIR, "EDGAR")
 EXCHANGE_SOURCE_DIR = os.path.join(ROOT_DIR, "EXCHANGE")
 INSIDER_SOURCE_DIR = os.path.join(ROOT_DIR, "INSIDERS")
+NCSR_DIR = os.path.join(ROOT_DIR, "NCSR")  # New subdir for isolation
+
 directories = [
     INSIDER_SOURCE_DIR,
     EXCHANGE_SOURCE_DIR,
@@ -53,11 +48,14 @@ directories = [
     CFTC_CREDIT_SOURCE_DIR,
     CFTC_EQUITY_SOURCE_DIR,
     CFTC_COMMODITIES_SOURCE_DIR,
+    CFTC_FOREX_SOURCE_DIR,
+    CFTC_RATES_SOURCE_DIR,
     NMFP_SOURCE_DIR,
     THRTNF_SOURCE_DIR,
     NPORT_SOURCE_DIR,
     NCEN_SOURCE_DIR,
     FORMD_SOURCE_DIR,
+    NCSR_DIR,
 ]
 
 for directory in directories:
@@ -65,7 +63,15 @@ for directory in directories:
 
 # Setup logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-
+# List of User-Agent strings for rotation
+user_agents = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.3",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:89.0) Gecko/20100101 Firefox/89.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:89.0) Gecko/20100101 Firefox/89.0",
+    "Mozilla/5.0 (X11; Linux x86_64; rv:89.0) Gecko/20100101 Firefox/89.0"
+]
 def check_and_install_modules():
     os_name = platform.system()
 
@@ -672,15 +678,13 @@ def allyourbasearebelongtous():
     log_file = os.path.join(EDGAR_SOURCE_DIR, "sec_download_log.txt")
     gamecat_ascii()
     
-    # Configure logging to write to a file
+    # Configure logging
     logging.basicConfig(
         level=logging.ERROR,
         format='%(asctime)s - %(levelname)s - %(message)s',
-        filename='error_log.txt',  
-        filemode='w'  
+        filename='error_log.txt',
+        filemode='w'
     )
-
-    # Log an error message
     logging.error("This is an error message")
 
     def log_progress(message):
@@ -689,36 +693,39 @@ def allyourbasearebelongtous():
         print(message)
 
     def check_file_size(url):
-        """Check the size of the file at the given URL."""
         try:
-            headers = {'User-Agent': "anonymous/FORTHELULZ@anonyops.com"}
+            headers = {'User-Agent': "FORTHELULZ@anonops.com"}  # Matching TheDoor.py
             response = requests.head(url, headers=headers, timeout=10)
             response.raise_for_status()
             return int(response.headers.get('Content-Length', 0))
         except requests.RequestException as e:
-            print(f"Failed to get size for {url}: {e}")
+            log_progress(f"Failed to get size for {url}: {e}", "FileSizeCheck")
             return None
 
     def download_file(url, download_directory):
-        """Download a file from the given URL, log the download, and compute MD5 hash."""
         try:
-            headers = {'User-Agent': "anonymous/FORTHELULZ@anonyops.com"}
-            response = requests.get(url, headers=headers, stream=True, timeout=30)
+            headers = {'User-Agent': "FORTHELULZ@anonops.com"}  # Matching TheDoor.py
+            response = requests.get(url, headers=headers, timeout=60)  # Longer timeout
             response.raise_for_status()
+            
+            content = response.content
+            if len(content) == 0:
+                log_progress(f"No content available for {url}", "Download")
+                return False
         
             filename = url.split('/')[-1]
-            cik = url.split('/data/')[1].split('/')[0]
+            cik = url.split('/data/')[1].split('/')[0] if '/data/' in url else 'unknown'
             dir_path = os.path.join(download_directory, cik)
             os.makedirs(dir_path, exist_ok=True)
             filepath = os.path.join(dir_path, filename)
-        
+    
             if os.path.exists(filepath):
                 with open(filepath, 'rb') as file:
                     file_hash = hashlib.md5()
                     while chunk := file.read(8192):
                         file_hash.update(chunk)
                     current_md5 = file_hash.hexdigest()
-            
+        
                 log_file = os.path.join(download_directory, 'download_log.txt')
                 if os.path.exists(log_file):
                     with open(log_file, 'r') as log:
@@ -727,30 +734,32 @@ def allyourbasearebelongtous():
                             if len(parts) == 4 and parts[2] == filepath:
                                 logged_md5 = parts[3]
                                 if current_md5 == logged_md5:
-                                    print(f"FILE already downloaded. {current_md5} verified: {filepath}")
+                                    log_progress(f"FILE already downloaded. {current_md5} verified: {filepath}", "Download")
                                     return True
-    
+
             with open(filepath, 'wb') as file:
-                for chunk in response.iter_content(chunk_size=8192):
-                    file.write(chunk)
-        
+                file.write(content)  # Full write like TheDoor.py
+            
             with open(filepath, 'rb') as file:
                 file_hash = hashlib.md5()
                 while chunk := file.read(8192):
                     file_hash.update(chunk)
                 md5_hash = file_hash.hexdigest()
-        
+    
+            log_file = os.path.join(download_directory, 'download_log.txt')
             log_entry = f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')},{url},{filepath},{md5_hash}\n"
             with open(log_file, 'a') as log:
                 log.write(log_entry)
-        
-            print(f"Downloaded: {filepath}, MD5: {md5_hash}")
-            return True
     
+            log_progress(f"Downloaded: {filepath}, Size: {os.path.getsize(filepath)} bytes, MD5: {md5_hash}", "Download")
+            return True
+
         except requests.RequestException as e:
-            print(f"Error downloading {url}: {e}")
+            if os.path.exists(filepath) and os.path.getsize(filepath) == 0:
+                os.remove(filepath)
+            log_progress(f"Error downloading {url}: {e}", "Download")
             return False
-        
+
     def process_line(line):
         parts = line.split('|')
         if len(parts) >= 5:
@@ -766,16 +775,17 @@ def allyourbasearebelongtous():
             for file_name in zip_ref.namelist():
                 if file_name.endswith('.idx'):
                     idx_content = zip_ref.read(file_name).decode('utf-8', errors='ignore')
-                    # Split by newline and skip the first 12 lines (assuming headers end at line 12)
                     return '\n'.join(idx_content.split('\n')[12:])
         raise FileNotFoundError("No IDX file found in ZIP archive.")
 
     def get_user_selection(zip_files):
-        print("\nEnter a 4-digit year, 'qtr' for specific quarter, or '0' to return to main menu:")
+        print("\nEnter a 4-digit year, 'qtr' for specific quarter, 'all' for all archives, or '0' to return to main menu:")
         while True:
-            choice = input("Your choice: ").strip()
+            choice = input("Your choice: ").strip().lower()
             if choice == '0':
                 return None
+            elif choice == 'all':
+                return zip_files
             elif choice == 'qtr':
                 print("\nAvailable ZIP files:")
                 for i, file in enumerate(zip_files, 1):
@@ -798,17 +808,14 @@ def allyourbasearebelongtous():
                     year_files = [f for f in zip_files if f.startswith(year) and f.endswith(f"_QTR{quarter}.zip")]
                 else:
                     year_files = [f for f in zip_files if f.startswith(year)]
-            
                 if year_files:
                     print(f"Processing files for year {year}, quarter {quarter if quarter else 'all'}:")
                     return year_files
-                else:
-                    print(f"No files found for year {year}, quarter {quarter if quarter else 'all'}.")
+                print(f"No files found for year {year}, quarter {quarter if quarter else 'all'}.")
             else:
-                print("Only 4-digit year format accepted. For example: 1999")
+                print("Only 4-digit year, 'qtr', 'all', or '0' accepted. For example: 1999, qtr, all")
 
     def process_zip(zip_path):
-        """Process a single ZIP file."""
         log_progress(f"Processing {zip_path}")
         idx_content = extract_idx_from_zip(zip_path)
         urls = [process_line(line) for line in idx_content.split('\n') if process_line(line)]
@@ -817,36 +824,16 @@ def allyourbasearebelongtous():
         failed = 0
         total_files = len(urls)
     
-        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+        with ThreadPoolExecutor(max_workers=4) as executor:
             futures = [executor.submit(download_file, url, EDGAR_SOURCE_DIR) for url in urls]
-            for future in concurrent.futures.as_completed(futures):
+            for future in tqdm(concurrent.futures.as_completed(futures), total=total_files, desc=f"Processing {os.path.basename(zip_path)}"):
                 if future.result():
                     downloaded += 1
                 else:
                     failed += 1
-                log_progress(f"Downloaded {downloaded}/{total_files}, Failed {failed}")
+                log_progress(f"Progress: Downloaded {downloaded}/{total_files}, Failed {failed}")
 
         log_progress(f"Finished processing {zip_path}. Downloaded {downloaded}/{total_files}, Failed {failed}")
-
-    try:
-        os.makedirs(EDGAR_SOURCE_DIR, exist_ok=True)
-        zip_files = [f for f in os.listdir(EDGAR_SOURCE_DIR) if f.endswith('.zip')]
-
-        while True:
-            selected_zips = get_user_selection(zip_files)
-            if not selected_zips:
-                break
-        
-            total_files = sum(len([process_line(line) for line in extract_idx_from_zip(os.path.join(EDGAR_SOURCE_DIR, zip)).split('\n') if process_line(line)]) for zip in selected_zips)
-        
-            for zip_file in selected_zips:
-                zip_path = os.path.join(EDGAR_SOURCE_DIR, zip_file)
-                process_zip(zip_path)
-
-        log_progress("SEC processing pipeline completed.")
-
-    except Exception as e:
-        log_progress(f"An error occurred: {e}")
 
     def remove_top_lines(file_path, lines_to_remove=11):
         """Remove the top `lines_to_remove` lines from the given file."""
@@ -858,44 +845,81 @@ def allyourbasearebelongtous():
 
     def compile_urls(zip_directory, idx_file):
         """Compile all URLs from the archives into master.idx."""
-        print(f"Compiling URLs from {zip_directory} into {idx_file}.")
-        for file in os.listdir(zip_directory):
-            if file.endswith('.zip'):
-                idx_file_path = extract_idx_from_zip(os.path.join(zip_directory, file))
-                remove_top_lines(idx_file_path)
-                with open(idx_file_path, 'r') as f:
-                    content = f.read()
-                with open(idx_file, 'a') as master_file:
-                    master_file.write(content)
-                os.remove(idx_file_path)
-                print(f"Processed {file}")
+        log_progress(f"Starting URL compilation from {zip_directory} into {idx_file}")
+        total_zips = len([f for f in os.listdir(zip_directory) if f.endswith('.zip')])
+        with tqdm(total=total_zips, desc="Compiling URLs") as pbar:
+            for file in os.listdir(zip_directory):
+                if file.endswith('.zip'):
+                    zip_path = os.path.join(zip_directory, file)
+                    idx_file_path = extract_idx_from_zip(zip_path)
+                    remove_top_lines(idx_file_path)
+                    with open(idx_file_path, 'r') as f:
+                        content = f.read()
+                    with open(idx_file, 'a') as master_file:
+                        master_file.write(content)
+                    os.remove(idx_file_path)
+                    log_progress(f"Processed ZIP file: {file}")
+                    pbar.update(1)
+        log_progress(f"URL compilation completed. Processed {total_zips} ZIP files")
 
     def scrape_sec(idx_file, download_directory):
         """Begin scraping the entire SEC."""
+        log_progress(f"Starting SEC scraping from {idx_file} to {download_directory}")
         os.makedirs(download_directory, exist_ok=True)
-        print(f"Starting SEC scraping from {idx_file} to {download_directory}")
 
         with open(idx_file, 'r', encoding='utf-8', errors='ignore') as file:
             lines = file.readlines()
         
         urls = [process_line(line) for line in lines if process_line(line) is not None]
+        total_urls = len(urls)
+        log_progress(f"Found {total_urls} URLs to scrape")
 
         def download_file_task(url):
             return download_file(url, download_directory)
         
-        failed_urls = []  # To track failed downloads
+        failed_urls = []
 
-        with concurrent.futures.ThreadPoolExecutor() as executor:
-            future_to_url = {executor.submit(download_file_task, url): url for url in urls}
-            for future in concurrent.futures.as_completed(future_to_url):
-                url, success = future.result()
-                if not success:
-                    failed_urls.append(url)
-                print(f"Downloaded {url} {'successfully' if success else 'with errors'}")
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            with tqdm(total=total_urls, desc="Scraping SEC") as pbar:
+                future_to_url = {executor.submit(download_file_task, url): url for url in urls}
+                for future in concurrent.futures.as_completed(future_to_url):
+                    url = future_to_url[future]
+                    success = future.result()
+                    if not success:
+                        failed_urls.append(url)
+                    log_progress(f"Processed URL: {url} {'successfully' if success else 'with errors'}")
+                    pbar.update(1)
 
-        print(f"Downloaded {len(urls) - len(failed_urls)} files successfully.")
+        downloaded = total_urls - len(failed_urls)
+        log_progress(f"Downloaded {downloaded} files successfully")
         if failed_urls:
-            print(f"Failed to download {len(failed_urls)} files.")
+            log_progress(f"Failed to download {len(failed_urls)} files", "Scraping", {"failed_urls": failed_urls})
+
+    try:
+        # Ensure the master.idx file is empty or create it
+        with open(idx_file, 'w') as master_file:
+            master_file.write("")  # Clear the file if it exists
+
+        zip_files = [f for f in os.listdir(EDGAR_SOURCE_DIR) if f.endswith('.zip')]
+
+        while True:
+            selected_zips = get_user_selection(zip_files)
+            if not selected_zips and zip_files:
+                selected_zips = zip_files
+            if not selected_zips:
+                break
+        
+            total_files = sum(len([process_line(line) for line in extract_idx_from_zip(os.path.join(EDGAR_SOURCE_DIR, zip)).split('\n') if process_line(line)]) for zip in selected_zips)
+            log_progress(f"Total files to process across {len(selected_zips)} ZIPs: {total_files}")
+        
+            for zip_file in selected_zips:
+                zip_path = os.path.join(EDGAR_SOURCE_DIR, zip_file)
+                process_zip(zip_path)
+
+        log_progress("SEC processing pipeline completed")
+
+    except Exception as e:
+        log_progress(f"An error occurred: {e}")
 
     try:
         # Ensure the master.idx file is empty or create it
@@ -907,7 +931,7 @@ def allyourbasearebelongtous():
         for zip_file in zip_files:
             zip_path = os.path.join(EDGAR_SOURCE_DIR, zip_file)
             try:
-                print(f"Processing {zip_file}")
+                log_progress(f"Processing ZIP file: {zip_file}")
                 idx_file_path = extract_idx_from_zip(zip_path)
                 remove_top_lines(idx_file_path)
                 
@@ -916,12 +940,10 @@ def allyourbasearebelongtous():
                 file_queue.put(content)
 
                 os.remove(idx_file_path)
-                
-                print(f"Successfully processed {zip_file}")
+                log_progress(f"Successfully processed ZIP file: {zip_file}")
             except Exception as e:
-                print(f"Error processing {zip_file}: {e}")
+                log_progress(f"Error processing {zip_file}: {e}")
 
-            # Write from the queue to the master.idx file after each zip file
             def write_to_master_file():
                 while not file_queue.empty():
                     content = file_queue.get()
@@ -930,23 +952,22 @@ def allyourbasearebelongtous():
 
             write_to_master_file()
 
-        print("Compilation complete! uwu")
+        log_progress("Compilation complete! uwu")
 
-        # Verbose start of compile_urls and scrape_sec
-        print("\nStarting to compile URLs from ZIP files...")
+        log_progress("Starting to compile URLs from ZIP files...")
         start_time = time.time()
         compile_urls(EDGAR_SOURCE_DIR, idx_file)
         end_time = time.time()
-        print(f"URL compilation completed in {end_time - start_time:.2f} seconds.")
+        log_progress(f"URL compilation completed in {end_time - start_time:.2f} seconds")
 
-        print("\nStarting to scrape SEC data...")
+        log_progress("Starting to scrape SEC data...")
         start_time = time.time()
         scrape_sec(idx_file, EDGAR_SOURCE_DIR)
         end_time = time.time()
-        print(f"SEC scraping completed in {end_time - start_time:.2f} seconds.")
+        log_progress(f"SEC scraping completed in {end_time - start_time:.2f} seconds")
 
     except Exception as e:
-        print(f"An error occurred: {e}")    
+        log_progress(f"An error occurred: {e}")
 def download_credit_archives():
     os.makedirs(CREDIT_SOURCE_DIR, exist_ok=True)
     gamecat_ascii()
@@ -1132,7 +1153,7 @@ def download_equities_archives():
 def equities_second():
     gamecat_ascii()
     
-    def parse_zips():
+    def parse_zips(search_terms):
         master = pd.DataFrame()  # Start with an empty dataframe
         zip_files = sorted(glob.glob(os.path.join(EQUITY_SOURCE_DIR, '*.zip')), key=lambda x: os.path.basename(x))  # Sort by filename to keep dates in order
         first_file_processed = False
@@ -1151,18 +1172,20 @@ def equities_second():
                         if not first_file_processed:
                             first_headers = df.columns.tolist()
                             first_file_processed = True
-                        match_found = False
-                        for column in df.columns:
-                            if column in df.columns and df[column].astype(str).str.contains(search_term, case=False, na=False).any():
-                                print(f"Matches found in column: {column}")
-                                matching_rows = df[df[column].astype(str).str.contains(search_term, case=False, na=False)]
-                                master = pd.concat([master, matching_rows], ignore_index=True)
-                                results_count += len(matching_rows)
-                                match_found = True
-                                print(f"Added {len(matching_rows)} matching rows. Total matches so far: {results_count}")
-                                break  # We've found a match, no need to check other columns
-                        if not match_found:
-                            print(f"No matches found in {csv_filename}")         
+                        # Combine all columns into a single string per row
+                        df['combined'] = df.apply(lambda row: ' '.join(row.astype(str)), axis=1)
+                        # Create a pattern for OR condition
+                        pattern = '|'.join(search_terms)
+                        # Find rows where any search term appears
+                        mask = df['combined'].str.contains(pattern, case=False, na=False)
+                        matching_rows = df[mask]
+                        # Drop the 'combined' column if it exists
+                        if 'combined' in matching_rows.columns:
+                            matching_rows = matching_rows.drop(columns=['combined'])
+                        # Add to master
+                        master = pd.concat([master, matching_rows], ignore_index=True)
+                        results_count += len(matching_rows)
+                        print(f"Added {len(matching_rows)} matching rows. Total matches so far: {results_count}")
             except Exception as e:
                 logging.error(f"Error processing {zip_file}: {e}")
                 print(f"Error occurred while processing {zip_file}. Continuing to next file.")
@@ -1170,15 +1193,20 @@ def equities_second():
         
         # If we have processed at least one file, ensure the CSV starts with the first file's headers
         if first_headers:
-            master = master.reindex(columns=first_headers, fill_value=None)  # Use None or pd.NA instead of pd.np.nan
+            master = master.reindex(columns=first_headers, fill_value=None)
         return master, results_count
 
     print("Press Enter when you are ready to parse the files, or type 'q' to quit.")
     user_input = input()
     if user_input.lower() != 'q':
-        search_term = input("Enter the search term: ").strip()
-        master, final_count = parse_zips()
-        master_csv_path = os.path.join(EQUITY_SOURCE_DIR, f"filtered_{search_term.replace(' ', '_')}.csv")
+        search_terms_input = input("Enter search terms separated by commas: ").strip()
+        search_terms = [term.strip() for term in search_terms_input.split(',')]
+        if not search_terms:
+            print("No search terms provided. Exiting.")
+            return
+        master, final_count = parse_zips(search_terms)
+        safe_terms = [re.sub(r'\W+', '_', term) for term in search_terms]
+        master_csv_path = os.path.join(EQUITY_SOURCE_DIR, f"filtered_{'_'.join(safe_terms)}.csv")
         master.to_csv(master_csv_path, index=False)
         print(f"\nSaving results to: {master_csv_path}")
         print(f"Total Matches Found: {final_count}")
@@ -1432,6 +1460,123 @@ def CFTC_commodities_second():
         logging.info(f"Parsing completed. Master file saved as {master_csv_path}")
     else:
         print("Exiting script.")
+def download_cftc_rates_archives():
+    os.makedirs(CFTC_RATES_SOURCE_DIR, exist_ok=True)
+
+    def generate_urls(start_date, end_date):
+        url_list = []
+        current_date = start_date
+        base_url = "https://pddata.dtcc.com/ppd/api/report/cumulative/cftc/CFTC_CUMULATIVE_RATES_"
+        while current_date <= end_date:
+            date_str = current_date.strftime('%Y_%m_%d')
+            url_list.append(f"{base_url}{date_str}.zip")
+            current_date += timedelta(days=1)
+        return url_list
+
+    def download_zip(url):
+        zip_filename = url.split('/')[-1]
+        temp_zip_path = os.path.join(CFTC_RATES_SOURCE_DIR, zip_filename)
+        
+        if os.path.exists(temp_zip_path):
+            logging.info(f"Skipping download of {zip_filename} as it already exists.")
+            return
+
+        try:
+            req = requests.get(url, stream=True)
+            req.raise_for_status()  # Raise an exception for bad status codes
+            file_size = int(req.headers.get('Content-Length', 0))
+            
+            with open(temp_zip_path, 'wb') as f:
+                for chunk in req.iter_content(chunk_size=8192):
+                    f.write(chunk)
+            
+            file_size_downloaded = os.path.getsize(temp_zip_path)
+            download_time = datetime.now()
+            
+            logging.info(f"Downloaded: {url}")
+            logging.info(f"Destination: {temp_zip_path}")
+            logging.info(f"Timestamp: {download_time}")
+            logging.info(f"Size: {file_size_downloaded} bytes")
+            logging.info(f"Expected Size: {file_size} bytes")
+            logging.info(f"File size match: {file_size == file_size_downloaded}")
+            
+        except requests.RequestException as e:
+            logging.error(f"Failed to download {url}: {e}")
+
+    end_date = datetime.now().date()
+    start_date = end_date - timedelta(days=2*365)  # Approximately 2 years back, accounting for leap years
+    urls = generate_urls(start_date, end_date)
+
+    with ThreadPoolExecutor(max_workers=16) as executor:
+        list(executor.map(download_zip, urls))  # Use list() to ensure all tasks are completed before moving on
+
+    print("Downloads completed.")
+    equitytquery = input("Would you like to search? (y)es or (n)o?:").strip()
+    if equitytquery == 'y':
+        cftc_rates_second()
+    else:
+        print("Y not pushed. exiting.")
+        exit(1)
+def cftc_rates_second():
+    gamecat_ascii()
+
+    def process_zip(zip_file):
+        results = []
+        try:
+            with ZipFile(zip_file, 'r') as zip_ref:
+                csv_filename = zip_ref.namelist()[0]  # Assuming only one CSV per zip
+                with zip_ref.open(csv_filename) as csv_file:
+                    df = pd.read_csv(csv_file, low_memory=False)
+                    for column in df.columns:
+                        if column in df.columns and df[column].astype(str).str.contains(search_term, case=False, na=False).any():
+                            matching_rows = df[df[column].astype(str).str.contains(search_term, case=False, na=False)]
+                            results.extend(matching_rows.to_dict('records'))  # Convert matching rows to list of dicts
+                            break  # We've found a match, no need to check other columns
+        except Exception as e:
+            logging.error(f"Error processing {zip_file}: {e}")
+        return results
+
+    def write_to_csv(results, csv_writer):
+        for row in results:
+            csv_writer.writerow(row)
+
+    # Main execution
+    print("Press Enter when you are ready to parse the files, or type 'q' to quit.")
+    user_input = input()
+    if user_input.lower() != 'q':
+        search_term = input("Enter the search term: ").strip()
+        zip_files = sorted(glob.glob(os.path.join(CFTC_RATES_SOURCE_DIR, '*.zip')), key=lambda x: os.path.basename(x))
+        total_files = len(zip_files)
+        print(f"\nStarting to process {total_files} zip files with 7 worker threads...")
+
+        master_csv_path = os.path.join(CFTC_RATES_SOURCE_DIR, f"filtered_{search_term.replace(' ', '_')}.csv")
+        
+        with open(master_csv_path, 'w', newline='') as csvfile:
+            csv_writer = csv.DictWriter(csvfile, fieldnames=None)  # We'll define fieldnames later
+            header_written = False
+
+            with ThreadPoolExecutor(max_workers=7) as executor:
+                # Process zip files
+                future_to_zip = {executor.submit(process_zip, zip_file): zip_file for zip_file in zip_files}
+                
+                for future in as_completed(future_to_zip):
+                    zip_file = future_to_zip[future]
+                    try:
+                        results = future.result()
+                        if results and not header_written:
+                            # Write header only once
+                            csv_writer.fieldnames = results[0].keys()
+                            csv_writer.writeheader()
+                            header_written = True
+                        write_to_csv(results, csv_writer)
+                        print(f"Processed: {zip_file}")
+                    except Exception as e:
+                        print(f"Exception in {zip_file}: {e}")
+            
+            print(f"\nSaving results to: {master_csv_path}")
+        logging.info(f"Parsing completed. Master file saved as {master_csv_path}")
+    else:
+        print("Exiting script.")
 def download_cftc_equities_archives():
     os.makedirs(CFTC_EQUITY_SOURCE_DIR, exist_ok=True)
 
@@ -1549,6 +1694,123 @@ def cftc_equities_second():
         logging.info(f"Parsing completed. Master file saved as {master_csv_path}")
     else:
         print("Exiting script.")
+def download_cftc_forex_archives():
+    os.makedirs(CFTC_FOREX_SOURCE_DIR, exist_ok=True)
+
+    def generate_urls(start_date, end_date):
+        url_list = []
+        current_date = start_date
+        base_url = "https://pddata.dtcc.com/ppd/api/report/cumulative/cftc/CFTC_CUMULATIVE_FOREX_"
+        while current_date <= end_date:
+            date_str = current_date.strftime('%Y_%m_%d')
+            url_list.append(f"{base_url}{date_str}.zip")
+            current_date += timedelta(days=1)
+        return url_list
+
+    def download_zip(url):
+        zip_filename = url.split('/')[-1]
+        temp_zip_path = os.path.join(CFTC_FOREX_SOURCE_DIR, zip_filename)
+        
+        if os.path.exists(temp_zip_path):
+            logging.info(f"Skipping download of {zip_filename} as it already exists.")
+            return
+
+        try:
+            req = requests.get(url, stream=True)
+            req.raise_for_status()  # Raise an exception for bad status codes
+            file_size = int(req.headers.get('Content-Length', 0))
+            
+            with open(temp_zip_path, 'wb') as f:
+                for chunk in req.iter_content(chunk_size=8192):
+                    f.write(chunk)
+            
+            file_size_downloaded = os.path.getsize(temp_zip_path)
+            download_time = datetime.now()
+            
+            logging.info(f"Downloaded: {url}")
+            logging.info(f"Destination: {temp_zip_path}")
+            logging.info(f"Timestamp: {download_time}")
+            logging.info(f"Size: {file_size_downloaded} bytes")
+            logging.info(f"Expected Size: {file_size} bytes")
+            logging.info(f"File size match: {file_size == file_size_downloaded}")
+            
+        except requests.RequestException as e:
+            logging.error(f"Failed to download {url}: {e}")
+
+    end_date = datetime.now().date()
+    start_date = end_date - timedelta(days=2*365)  # Approximately 2 years back, accounting for leap years
+    urls = generate_urls(start_date, end_date)
+
+    with ThreadPoolExecutor(max_workers=16) as executor:
+        list(executor.map(download_zip, urls))  # Use list() to ensure all tasks are completed before moving on
+
+    print("Downloads completed.")
+    equitytquery = input("Would you like to search? (y)es or (n)o?:").strip()
+    if equitytquery == 'y':
+        cftc_forex_second()
+    else:
+        print("Y not pushed. exiting.")
+        exit(1)
+def cftc_forex_second():
+    gamecat_ascii()
+
+    def process_zip(zip_file):
+        results = []
+        try:
+            with ZipFile(zip_file, 'r') as zip_ref:
+                csv_filename = zip_ref.namelist()[0]  # Assuming only one CSV per zip
+                with zip_ref.open(csv_filename) as csv_file:
+                    df = pd.read_csv(csv_file, low_memory=False)
+                    for column in df.columns:
+                        if column in df.columns and df[column].astype(str).str.contains(search_term, case=False, na=False).any():
+                            matching_rows = df[df[column].astype(str).str.contains(search_term, case=False, na=False)]
+                            results.extend(matching_rows.to_dict('records'))  # Convert matching rows to list of dicts
+                            break  # We've found a match, no need to check other columns
+        except Exception as e:
+            logging.error(f"Error processing {zip_file}: {e}")
+        return results
+
+    def write_to_csv(results, csv_writer):
+        for row in results:
+            csv_writer.writerow(row)
+
+    # Main execution
+    print("Press Enter when you are ready to parse the files, or type 'q' to quit.")
+    user_input = input()
+    if user_input.lower() != 'q':
+        search_term = input("Enter the search term: ").strip()
+        zip_files = sorted(glob.glob(os.path.join(CFTC_FOREX_SOURCE_DIR, '*.zip')), key=lambda x: os.path.basename(x))
+        total_files = len(zip_files)
+        print(f"\nStarting to process {total_files} zip files with 7 worker threads...")
+
+        master_csv_path = os.path.join(CFTC_FOREX_SOURCE_DIR, f"filtered_{search_term.replace(' ', '_')}.csv")
+        
+        with open(master_csv_path, 'w', newline='') as csvfile:
+            csv_writer = csv.DictWriter(csvfile, fieldnames=None)  # We'll define fieldnames later
+            header_written = False
+
+            with ThreadPoolExecutor(max_workers=7) as executor:
+                # Process zip files
+                future_to_zip = {executor.submit(process_zip, zip_file): zip_file for zip_file in zip_files}
+                
+                for future in as_completed(future_to_zip):
+                    zip_file = future_to_zip[future]
+                    try:
+                        results = future.result()
+                        if results and not header_written:
+                            # Write header only once
+                            csv_writer.fieldnames = results[0].keys()
+                            csv_writer.writeheader()
+                            header_written = True
+                        write_to_csv(results, csv_writer)
+                        print(f"Processed: {zip_file}")
+                    except Exception as e:
+                        print(f"Exception in {zip_file}: {e}")
+            
+            print(f"\nSaving results to: {master_csv_path}")
+        logging.info(f"Parsing completed. Master file saved as {master_csv_path}")
+    else:
+        print("Exiting script.")
 def download_ncen_archives():
     BASE_URL = "https://www.sec.gov/files/dera/data/form-n-cen-data-sets/"
     urls = [
@@ -1574,6 +1836,8 @@ def download_ncen_archives():
         BASE_URL + "2024q2_ncen.zip",
         BASE_URL + "2024q3_ncen.zip",
         BASE_URL + "2024q4_ncen.zip",
+        BASE_URL + "2025q1_ncen.zip",
+        BASE_URL + "2025q2_ncen.zip",
     ]
     
     download_archives(NCEN_SOURCE_DIR, FILELIST, urls)
@@ -1600,6 +1864,9 @@ def download_nport_archives():
         BASE_URL + "2024q1_nport.zip",
         BASE_URL + "2024q2_nport.zip",
         BASE_URL + "2024q3_nport.zip",
+        BASE_URL + "2024q4_nport.zip",
+  #      BASE_URL + "2025q1_nport.zip",
+  #      BASE_URL + "2025q2_nport.zip",
     ]
     
     download_archives(NPORT_SOURCE_DIR, FILELIST, urls)
@@ -1804,6 +2071,254 @@ def download_formd_archives():
     ]
     
     download_archives(FORMD_SOURCE_DIR, FILELIST, urls)
+def download_ncsr_filings(start_year=2004, end_year=2025, log_file=None, save_index=True):
+    """
+    Parse master.idx from existing ZIP indexes in ./edgar/, filter for N-CSR,
+    and download only missing .txt files to prevent duplicates.
+    Uses sec_download_log.txt (or provided log_file) for logging new downloads.
+    
+    If save_index=True, saves the full list of N-CSR entries as ./edgar/ncsr_index.json
+    after parsing (for future reference or analysis).
+    """
+    import json
+    EDGAR_DIR = EDGAR_SOURCE_DIR
+    # Define log file path inside the function (specific to this func)
+    # Assign first to avoid unbound issues, then override if needed
+    log_file = os.path.join(EDGAR_DIR, "sec_download_log.txt") if log_file is None else log_file
+    os.makedirs(os.path.dirname(log_file), exist_ok=True)  # Ensure dir exists
+    
+    logging.info(f"Parsing N-CSR from local indexes ({start_year}-{end_year})")
+    
+    # Find all ZIP files
+    zip_pattern = os.path.join(EDGAR_DIR, "*_QTR*.zip")
+    zip_files = glob.glob(zip_pattern)
+    zip_files.sort()  # Chronological order
+    
+    if not zip_files:
+        logging.warning("No ZIP files found in %s", EDGAR_DIR)
+        return
+    
+    all_ncsr_entries = []
+    
+    for zip_path in tqdm(zip_files, desc="Parsing ZIP indexes"):
+        try:
+            with zipfile.ZipFile(zip_path, 'r') as z:
+                namelist = z.namelist()
+                if 'master.idx' not in namelist:
+                    logging.debug(f"No master.idx in {os.path.basename(zip_path)}")
+                    continue
+                
+                # Read master.idx without extracting
+                with z.open('master.idx') as f:
+                    content = f.read().decode('utf-8', errors='ignore')
+                    lines = content.splitlines()
+                    if not lines:
+                        continue
+                    
+                    # Skip header (first line)
+                    lines = lines[1:]
+                    
+                    # Parse ZIP name for year (handles _ or - separator)
+                    basename = os.path.basename(zip_path)
+                    match = re.match(r'(\d{4})[_-]QTR(\d)\.zip', basename)
+                    if not match:
+                        logging.debug(f"Could not parse year/QTR from {basename}")
+                        continue
+                    
+                    year = int(match.group(1))
+                    if year < start_year or year > end_year:
+                        continue
+                    
+                    for line in lines:
+                        parts = [p.strip() for p in line.split('|')]
+                        if len(parts) < 5:
+                            continue  # Skip malformed lines
+                        
+                        # Detect format and extract fields
+                        if len(parts) == 6:
+                            # Modern: Accession|Form|Company|CIK|Date|File Name
+                            form_idx = 1
+                            cik_idx = 3
+                            date_idx = 4
+                            path_idx = 5
+                            accession = parts[0].replace('-', '/')  # For URL construction
+                            file_path = parts[path_idx]
+                            file_name = os.path.basename(file_path)  # Just the .txt filename
+                            txt_url = f"https://www.sec.gov/Archives/edgar/data/{parts[cik_idx].zfill(10)}/{accession}/{file_name}"
+                        elif len(parts) == 5:
+                            # Historical: CIK|Company|Form|Date|File Name (full relative path)
+                            form_idx = 2
+                            cik_idx = 0
+                            date_idx = 3
+                            path_idx = 4
+                            accession = None
+                            file_path = parts[path_idx]
+                            file_name = os.path.basename(file_path)
+                            txt_url = f"https://www.sec.gov/Archives/{file_path}"  # Uses full historical path
+                        else:
+                            continue  # Unexpected format
+                        
+                        form = parts[form_idx]
+                        if form == "N-CSR":
+                            cik = parts[cik_idx].zfill(10)
+                            date_filed = parts[date_idx]
+                            all_ncsr_entries.append({
+                                'cik': cik,
+                                'accession': accession or '',  # Empty for historical
+                                'file_name': file_name,
+                                'date_filed': date_filed,
+                                'txt_url': txt_url,  # Pre-construct for easy download
+                                'year': year
+                            })
+                            
+        except Exception as e:
+            logging.warning(f"Error parsing {zip_path}: {e}")
+            continue
+    
+    logging.info(f"Found {len(all_ncsr_entries)} N-CSR entries across indexes")
+    
+    # Optional: Save the full index as JSON
+    if save_index:
+        index_file = os.path.join(EDGAR_DIR, "ncsr_index.json")
+        try:
+            with open(index_file, 'w', encoding='utf-8') as f:
+                json.dump(all_ncsr_entries, f, indent=2, default=str)
+            logging.info(f"Saved N-CSR index to {index_file}")
+        except Exception as e:
+            logging.warning(f"Failed to save index to {index_file}: {e}")
+    
+    # Load existing hashes/sizes/etags from log for resume functionality
+    # Log format: timestamp,file_name,file_size,file_hash,url,etag
+    log_data = {}
+    if os.path.exists(log_file):
+        try:
+            with open(log_file, 'r', encoding='utf-8') as f:
+                for line in f:
+                    parts = line.strip().split(',')
+                    if len(parts) >= 5:  # At least up to hash/url
+                        file_name = parts[1]
+                        log_data[file_name] = {
+                            'size': int(parts[2]),
+                            'hash': parts[3],
+                            'url': parts[4],
+                            'etag': parts[5] if len(parts) > 5 else None
+                        }
+        except Exception as e:
+            logging.warning(f"Error reading log file {log_file}: {e}")
+    
+    # Download only missing .txt files
+    downloaded_count = 0
+    verified_count = 0
+    for entry in tqdm(all_ncsr_entries, desc="Downloading/Verifying N-CSR"):
+        txt_filename = f"{entry['cik']}_{entry['date_filed']}_{entry['file_name']}"
+        txt_path = os.path.join(NCSR_DIR, txt_filename)
+        
+        skip = False
+        if os.path.exists(txt_path):
+            try:
+                # Compute local hash and size
+                local_size = os.path.getsize(txt_path)
+                hasher = hashlib.sha256()
+                with open(txt_path, 'rb') as f:
+                    while chunk := f.read(8192):
+                        hasher.update(chunk)
+                local_hash = hasher.hexdigest()
+                
+                if txt_filename in log_data:
+                    log_hash = log_data[txt_filename]['hash']
+                    if local_hash == log_hash:
+                        skip = True
+                        logging.debug(f"Skipping (exists and hash matches): {txt_filename}")
+                    else:
+                        logging.info(f"File exists but hash mismatch: {txt_filename}. Redownloading.")
+                else:
+                    # Existing file, no log entry: Verify/log local and skip
+                    logging.info(f"Verified existing file (no prior log): {txt_filename}. Logging hash.")
+                    with open(log_file, 'a', encoding='utf-8') as log:
+                        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        url = entry['txt_url']
+                        etag = ''  # None for local verify
+                        log.write(f"{timestamp},{txt_filename},{local_size},{local_hash},{url},{etag}\n")
+                    verified_count += 1
+                    skip = True
+            except Exception as e:
+                logging.warning(f"Could not hash/verify {txt_path}: {e}. Proceeding to download.")
+        
+        if skip:
+            continue
+        
+        # Robust download with retries and headers (adapted from your proven method)
+        url = entry['txt_url']
+        file_name = txt_filename  # For logging
+        success = False
+        max_attempts = 3
+        for attempt in range(max_attempts):
+            try:
+                headers = {'User-Agent': "FORTHELULZ@anonops.com"}  # Use your email/domain here
+                req = urllib.request.Request(url, headers=headers)
+                with urllib.request.urlopen(req, timeout=30) as response:  # Bumped timeout for large files
+                    if response.getcode() == 200:
+                        content = response.read()
+                        file_size = len(content)
+                        file_hash = hashlib.sha256(content).hexdigest()
+                        etag = response.headers.get('ETag', '').strip('"')  # Capture ETag, strip quotes
+                        logging.info(f"Successfully downloaded {file_name}. Size: {file_size} bytes. Hash: {file_hash}")
+                        
+                        # Write content to file
+                        with open(txt_path, 'wb') as f:
+                            f.write(content)
+                        
+                        downloaded_count += 1
+                        success = True
+                        
+                        # Log the download
+                        with open(log_file, 'a', encoding='utf-8') as log:
+                            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                            log.write(f"{timestamp},{file_name},{file_size},{file_hash},{url},{etag}\n")
+                        logging.info(f"Logged download of {file_name}")
+                        break
+                    else:
+                        logging.warning(f"Failed to download {file_name}. Status: {response.getcode()}")
+                        if response.getcode() == 429:
+                            retry_after = response.headers.get('Retry-After', '60')
+                            try:
+                                sleep_time = int(retry_after)
+                            except ValueError:
+                                sleep_time = 60  # Default 60s for 429
+                            logging.warning(f"Rate limited (429). Sleeping {sleep_time}s before next attempt.")
+                            time.sleep(sleep_time)
+            except urllib.error.HTTPError as e:
+                if e.code == 429:
+                    retry_after = e.headers.get('Retry-After', '60') if e.headers else '60'
+                    try:
+                        sleep_time = int(retry_after)
+                    except ValueError:
+                        sleep_time = 60  # Default 60s for 429
+                    logging.warning(f"Rate limited (429) on attempt {attempt + 1} for {file_name}. Sleeping {sleep_time}s.")
+                    if attempt < max_attempts - 1:
+                        time.sleep(sleep_time)
+                    continue
+                else:
+                    logging.warning(f"HTTP Error {e.code} on attempt {attempt + 1} for {file_name}: {e}")
+                    if attempt < max_attempts - 1:
+                        time.sleep(2 ** attempt)  # Exponential backoff
+            except urllib.error.URLError as e:
+                logging.warning(f"URL Error on attempt {attempt + 1} for {file_name}: {e}")
+                if attempt < max_attempts - 1:
+                    time.sleep(2 ** attempt)  # Exponential backoff
+            except Exception as e:
+                logging.warning(f"Unexpected error on attempt {attempt + 1} for {file_name}: {e}")
+                if attempt < max_attempts - 1:
+                    time.sleep(2 ** attempt)  # Exponential backoff
+        
+        if not success:
+            logging.error(f"Max attempts reached for {file_name}. Moving on.")
+        
+        # Global rate limiting: Sleep 0.1s after every attempt to stay under 10 req/sec
+        time.sleep(0.1)
+    
+    logging.info(f"N-CSR process complete. Downloaded {downloaded_count} new files, verified {verified_count} existing to {NCSR_DIR}")
+    logging.info(f"Download history updated in {log_file}")
 def download_edgar_archives():
     global failed_downloads
     global verbose
@@ -2110,44 +2625,36 @@ def edgar_second():
     search_thread.start()
     search_thread.join()  # Wait for the thread to complete
 def edgar_third(csv_file, method):
-    def list_csv_files(EDGAR_SOURCE_DIR):
-        return [f for f in os.listdir(EDGAR_SOURCE_DIR) if f.endswith('_results.csv')]
-
     def download_from_csv(csv_file):
-        #gamecat_ascii()
         base_url = "https://www.sec.gov/Archives/"
         base_download_dir = EDGAR_SOURCE_DIR
-        headers = {'User-Agent': "anonymous/FORTHELULZ@anonyops.com"}
-        retries=3
-        delay=1
-        verbose=True
+        headers = {'User-Agent': "FORTHELULZ@anonops.com"}  # From TheDoor.py
+        retries = 3
+        delay = 1
         full_csv_path = os.path.join(base_download_dir, csv_file)
-        # Count total rows to set progress bar length
-        with open(full_csv_path, newline='', encoding='utf-8') as csvfile:
-            total_rows = sum(1 for row in csv.reader(csvfile)) - 1  # Subtract 1 for header
         
-        # Reset file pointer to start
+        with open(full_csv_path, newline='', encoding='utf-8') as csvfile:
+            total_rows = sum(1 for row in csv.reader(csvfile)) - 1
+        
         with open(full_csv_path, newline='', encoding='utf-8') as csvfile:
             reader = csv.reader(csvfile)
-            header = next(reader, None)  # Skip header but save it
-            rows = list(reader)  # Read all rows into memory for easy manipulation
-            
-            # Ensure 'Download Location' is in the header
+            header = next(reader, None)
+            rows = list(reader)
             if 'Download Location' not in header:
                 header.append('Download Location')
             
-            # Initialize progress bar
             pbar = tqdm(total=total_rows, desc="Downloading", unit="file")
-            
             failed_downloads = []
+            
             for row in rows:
                 if len(row) < 5:
                     pbar.update(1)
                     continue
                 
                 cik = row[0]
-                url = base_url + row[4]
-                filename = url.split('/')[-1]
+                relative_url = row[4].lstrip('/')
+                url = f"{base_url}{relative_url}"
+                filename = os.path.basename(url)
                 cik_dir = os.path.join(base_download_dir, cik)
                 os.makedirs(cik_dir, exist_ok=True)
                 full_path = os.path.join(cik_dir, filename)
@@ -2155,324 +2662,42 @@ def edgar_third(csv_file, method):
                 download_success = False
                 for attempt in range(retries):
                     try:
-                        # Corrected here: Use of Request and urlopen
                         req = urllib.request.Request(url, headers=headers)
-                        with urllib.request.urlopen(req, timeout=10) as response:
+                        with urllib.request.urlopen(req, timeout=30) as response:
                             if response.getcode() != 200:
-                                raise HTTPError(url, response.getcode(), "Non-200 status code", headers, None)
+                                raise urllib.error.HTTPError(url, response.getcode(), "Non-200 status", {}, None)
+                            content = response.read()
+                            if len(content) == 0:
+                                raise ValueError("No content in response")
                             with open(full_path, 'wb') as file:
-                                file.write(response.read())  
+                                file.write(content)
+                            if os.path.getsize(full_path) == 0:
+                                os.remove(full_path)
+                                raise ValueError("File size is 0 after write")
                             download_success = True
                             break
-                    except (HTTPError, URLError, IOError) as e:
-                        print(f"Attempt {attempt + 1} failed: {e}")
-                        if attempt < retries - 1:  # No need to sleep after the last attempt
-                            time.sleep(delay * (2 ** attempt))  # Exponential backoff
+                    except (urllib.error.HTTPError, urllib.error.URLError, ValueError) as e:
+                        print(f"Attempt {attempt + 1} failed for {url}: {e}")
+                        if attempt < retries - 1:
+                            time.sleep(delay * (2 ** attempt))
                 
                 if download_success:
-                    download_timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    row.append(full_path)  # Add the download location to the row
+                    row.append(full_path)
                 else:
                     failed_downloads.append(url)
-                    row.append('Failed')  # Indicate failure in the download location
+                    row.append('Failed')
                 
                 pbar.update(1)
             
             pbar.close()
         
-        # Write back to CSV with the new column
-        with open(csv_file, 'w', newline='') as csvfile:
-            writer = csv.writer(csvfile)
-            writer.writerow(header)  # Write the updated header
-            writer.writerows(rows)  # Write the updated rows
-
-        # Create HTML index with the name based on the CSV file
-        base_name = os.path.splitext(os.path.basename(csv_file))[0]
-        html_file_name = f"{base_name}_index.html"
-
-        with open(html_file_name, 'w', encoding='utf-8') as htmlfile:
-            htmlfile.write('''
-            <!DOCTYPE html>
-            <html lang="en">
-            <head>
-                <meta charset="UTF-8">
-                <title>Download Index</title>
-                <style>
-                    table {
-                        border-collapse: collapse;
-                        width: 100%;
-                    }
-                    th, td {
-                        border: 1px solid black;
-                        padding: 8px;
-                        text-align: left;
-                    }
-                    th {
-                        cursor: pointer;
-                        background-color: #f2f2f2;
-                    }
-                    .ascii-art {
-                        font-family: monospace;
-                        white-space: pre;
-                    }
-                </style>
-                <script>
-                    function sortTable(n) {
-                        var table, rows, switching, i, x, y, shouldSwitch, dir, switchcount = 0;
-                        table = document.getElementById("downloadIndex");
-                        switching = true;
-                        dir = "asc";
-                        while (switching) {
-                            switching = false;
-                            rows = table.rows;
-                            for (i = 1; i < (rows.length - 1); i++) {
-                                shouldSwitch = false;
-                                x = rows[i].getElementsByTagName("TD")[n];
-                                y = rows[i + 1].getElementsByTagName("TD")[n];
-                                if (dir == "asc") {
-                                    if (x.innerHTML.toLowerCase() > y.innerHTML.toLowerCase()) {
-                                        shouldSwitch = true;
-                                        break;
-                                    }
-                                } else if (dir == "desc") {
-                                    if (x.innerHTML.toLowerCase() < y.innerHTML.toLowerCase()) {
-                                        shouldSwitch = true;
-                                        break;
-                                    }
-                                }
-                            }
-                            if (shouldSwitch) {
-                                rows[i].parentNode.insertBefore(rows[i + 1], rows[i]);
-                                switching = true;
-                                switchcount++;
-                            } else {
-                                if (switchcount == 0 && dir == "asc") {
-                                    dir = "desc";
-                                    switching = true;
-                                }
-                            }
-                        }
-                    }
-                </script>
-            </head>
-            <body>
-                <div class="ascii-art">
-                    <!-- Place for ASCII art -->
-                    frames = []
-                </div>
-                <table id="downloadIndex">
-                    <tr>
-                        ''' + ''.join(f'<th onclick="sortTable({i})">{h}</th>' for i, h in enumerate(header)) + '''
-                    </tr>
-            ''')
-            for row in rows:
-                htmlfile.write('<tr>')
-                for item in row:
-                    if item.startswith('./edgar') or item == 'Failed':
-                        htmlfile.write(f'<td><a href="file://{os.path.abspath(item)}">{item}</a></td>' if item != 'Failed' else f'<td>{item}</td>')
-                    else:
-                        htmlfile.write(f'<td>{item}</td>')
-                htmlfile.write('</tr>')
-            htmlfile.write('''
-                </table>
-            </body>
-            </html>
-            ''')
-
-        print(f"HTML index with sorting capability created: {html_file_name}")
-
-        # Remember to add a timestamp to each row during the download process, like:
-        # row.append(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
-
-    def download_from_crawling(csv_file):
-        #gamecat_ascii()
-        """
-        Initiates a grand adventure in data acquisition from the depths of the SEC's EDGAR system,
-        using a CSV file as the treasure map. Each CIK is a new quest, each file a piece of lore to be gathered.
-        
-        :param csv_file: The ancient scroll (CSV file) containing CIKs, the keys to untold digital riches.
-        """
-        base_download_dir = EDGAR_SOURCE_DIR
-        ciks = set()  # A set, because who likes duplicates in their treasure chest?
-        full_csv_path = os.path.join(base_download_dir, csv_file)
-
-        # Reading the ancient scroll
-        with open(full_csv_path, newline='', encoding='utf-8') as csvfile:
-            reader = csv.reader(csvfile)
-            # Skipping the sacred header, if it exists
-            next(reader, None) 
-            for row in reader:
-                if len(row) < 1:
-                    print(f"Skipping {row} due to lack of substance: likely a cursed line in the scroll.")
-                    continue
-                cik = row[0]
-                ciks.add(cik)
-        def fetch_directory(url):
-            retries=3
-            delay=1
-            verbose=True
-            headers = {
-                'User-Agent': "anonymous/FORTHELULZ@anonyops.com"  # Assuming you've defined this header elsewhere
-            }
-            
-            for attempt in range(retries):
-                try:
-                    print(f"Fetching URL: {url}")
-                    req = urllib.request.Request(url, headers=headers)
-                    with urllib.request.urlopen(req, timeout=10) as response:
-                        if response.getcode() != 200:
-                            raise HTTPError(url, response.getcode(), "Non-200 status code", headers, None)
-                        time.sleep(delay)  # Slow down to avoid rate limiting
-                        # Here we read the content and then parse it with BeautifulSoup
-                        content = response.read()
-                        return BeautifulSoup(content, 'html.parser')
-                except (HTTPError, URLError) as e:
-                    print(f"Attempt {attempt + 1} failed for {url}: {e}")
-                    if attempt < retries - 1:  # No sleep til brooklyn
-                        time.sleep(delay * (attempt + 1))  # Exponential backoff
-            raise Exception(f"Failed to fetch {url} after {retries} retries")
-
-        def scrape_subdirectories(sec_url):
-            soup = fetch_directory(sec_url)
-            rows = soup.find_all('a')
-            subdirectories = []
-            for row in rows:
-                href = row.get('href')
-                # Check if the href is a subdirectory link with 18-digit numeric names
-                if href and href.startswith('/Archives/edgar/data/') and len(href.strip('/').split('/')[-1]) == 18:
-                    subdirectories.append(href.strip('/').split('/')[-1])
-                else:
-                    print(f"Skipping non-matching href: {href}")  # Log non-matching hrefs for debugging
-            print(f"Scraped subdirectories: {subdirectories}\n ")
-            return subdirectories
-        # Ensure the treasure vault exists
-        os.makedirs(base_download_dir, exist_ok=True)
-        header = ['CIK', 'URL', 'Download Location', 'Status']
-        rows = []
-
-        # Here, we call upon the `download_file` spell, our brave knight in this saga
-        def download_file(url, directory, retries=3, delay=1):
-            # The spell to conjure a file from the digital ether
-            for attempt in range(retries):
-                try:
-                    headers = {
-                        'User-Agent': "anonymous/FORTHELULZ@anonyops.com"
-                    }                    
-                    print(f"Attempting to download {url}...")
-                    # The spell to conjure a file from the digital ether
-                    req = urllib.request.Request(url, headers=headers)
-                    with urllib.request.urlopen(req, timeout=10) as response:
-                        if response.getcode() != 200:
-                            raise HTTPError(url, response.getcode(), "Non-200 status code", headers, None)
-                        file_content = response.read()  # Store the file content
-
-                        filename = os.path.join(directory, os.path.basename(url))
-                        with open(filename, 'wb') as file:
-                            file.write(response.read())  # Changed from response.content to response.read()
-                        print(f"Downloaded: {filename}")
-                        md5_hash = hashlib.md5(file_content).hexdigest()
-                        timestamp = datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
-                        log_filename = os.path.join(directory, os.path.splitext(os.path.basename(url))[0] + '-legal-source-log.txt')
-                        with open(log_filename, 'w') as log_file:
-                            log_file.write(f"URL: {url}\nDownloaded at: {timestamp},\n{filename} with MD5 :{md5_hash}\n")
-                        print(f"Logged download details to {log_filename}")
-                        file_size = os.path.getsize(filename)
-                        print(f"File size: {file_size} bytes - the weight of this digital artifact")
-                        return True
-
-                except (HTTPError, URLError) as e:
-                    print(f"Attempt {attempt + 1} failed for {url}: {e} - A dragon guards this treasure!")
-                    if attempt < retries - 1:  # No need to sleep after the last attempt
-                        time.sleep(delay * (attempt + 1))
-            print(f"Failed to download {url} after {retries} retries - The treasure remains elusive")
-            return False
-
-        #for cik in ciks:
-        def process_cik(cik):
-            # The URL where our quest begins
-            sec_url_full = f"https://www.sec.gov/Archives/edgar/data/{cik}/"
-            print(f"Embarking on the quest for {sec_url_full}...")
-
-            folder_name = sec_url_full.rstrip('/').split('/')[-1]
-            full_download_directory = os.path.join(base_download_dir, folder_name)
-            print(f"Full download directory: {full_download_directory} - Here lies our treasure vault")
-
-            # Here we call upon the ancient rites to reveal hidden paths
-            subdirectories = scrape_subdirectories(sec_url_full)
-            if not subdirectories:
-                print(f"No hidden chambers found at {sec_url_full}. Exiting this quest.")
-                #continue
-
-            full_subdirectory_urls = [f"{sec_url_full.rstrip('/')}/{sub}" for sub in subdirectories]
-            
-            sanitized_file_path = 'sanitized_subdirectories.txt'
-            with open(sanitized_file_path, 'w') as sanitized_file:
-                sanitized_file.write('\n'.join(full_subdirectory_urls))
-            print(f"Sanitized list created: {sanitized_file_path} - The map to hidden chambers is drawn")
-
-            output_file_path = 'completed_subdirectories.txt'
-            if os.path.exists(output_file_path):
-                with open(output_file_path, 'r') as file:
-                    completed_subdirectories = [line.strip() for line in file]
-            else:
-                completed_subdirectories = []
-
-            os.makedirs(full_download_directory, exist_ok=True)
-            print(f"Download directory created: {full_download_directory} - The vault is ready to receive its riches")
-
-            total_subdirectories = len(full_subdirectory_urls)
-            processed_subdirectories = len(completed_subdirectories)
-
-            for subdirectory in full_subdirectory_urls:
-                if subdirectory in completed_subdirectories:
-                    print(f"Skipping already plundered chamber: {subdirectory}")
-                    continue
-
-                print(f"Venturing into the chamber: {subdirectory}")
-                try:
-                    # Summoning the directory's content with an ancient spell
-                    soup = fetch_directory(subdirectory)
-                    # Extracting the scrolls of knowledge from the chamber
-                    links = soup.find_all('a')
-                    txt_links = [link.get('href') for link in links if link.get('href') and link.get('href').endswith('.txt')]
-                    print(f"Found txt links in {subdirectory}: {txt_links} - Scrolls of lore discovered")
-                    for txt_link in txt_links:
-                        txt_url = "https://www.sec.gov" + txt_link
-                        print(f"Downloading txt file: {txt_url} - Securing the scroll")
-                        download_success = download_file(txt_url, full_download_directory)
-                        download_location = os.path.join(full_download_directory, os.path.basename(txt_url)) if download_success else 'Failed'
-                        rows.append([cik, txt_url, download_location, 'Success' if download_success else 'Failed'])
-                        if download_success:
-                            with open(output_file_path, 'a') as completed_file:
-                                completed_file.write(subdirectory + '\n')
-                            break
-                        time.sleep(.1)  # A brief rest to avoid angering the digital spirits
-                except Exception as e:
-                    print(f"Failed to access {subdirectory}: {e} - Beware, for this path is cursed!")
-                    with open('error_log.txt', 'a') as error_log_file:
-                        error_log_file.write(f"Failed to access {subdirectory}: {e}\n")
-
-                processed_subdirectories += 1
-                print(f"Progress: {processed_subdirectories}/{total_subdirectories} chambers explored.")
-
-            remaining_subdirectories = [sub for sub in full_subdirectory_urls if sub not in completed_subdirectories]
-
-            with open(sanitized_file_path, 'w') as sanitized_file:
-                sanitized_file.write('\n'.join(remaining_subdirectories))
-
-            print("Download complete for current CIK - The quest for this treasure trove ends.")
-        # Using ThreadPoolExecutor for concurrent processing of CIKs
-        with ThreadPoolExecutor(max_workers=4) as executor:  # Adjust max_workers as needed
-            executor.map(process_cik, ciks)
-
-        # After all downloads, write to CSV
-        with open(csv_file, 'w', newline='') as csvfile:
+        with open(full_csv_path, 'w', newline='') as csvfile:
             writer = csv.writer(csvfile)
             writer.writerow(header)
             writer.writerows(rows)
 
-        # Create HTML index
-        html_file_name = os.path.splitext(csv_file)[0] + '_index.html'
+        base_name = os.path.splitext(os.path.basename(csv_file))[0]
+        html_file_name = f"{base_name}_index.html"
         with open(html_file_name, 'w', encoding='utf-8') as htmlfile:
             htmlfile.write('<!DOCTYPE html><html><head><title>Download Index</title></head><body><table border="1">')
             htmlfile.write('<tr>' + ''.join(f'<th>{h}</th>' for h in header) + '</tr>')
@@ -2482,30 +2707,200 @@ def edgar_third(csv_file, method):
                     if item.startswith('./edgar') or item == 'Failed':
                         htmlfile.write(f'<td><a href="file://{os.path.abspath(item)}">{item}</a></td>' if item != 'Failed' else f'<td>{item}</td>')
                     else:
-                        htmlfile.write(f'<td><a href="{item}">{item}</a></td>')
+                        htmlfile.write(f'<td>{item}</td>')
                 htmlfile.write('</tr>')
             htmlfile.write('</table></body></html>')
+        print(f"HTML index created: {html_file_name}")
 
-        print(f"Quest completed for {len(ciks)} CIKs. CSV updated and HTML index created. May their data enrich our realms!")
+    def download_from_crawling(csv_file):
+        base_download_dir = EDGAR_SOURCE_DIR
+        ciks = set()
+        full_csv_path = os.path.join(base_download_dir, csv_file)
+        print(f"Attempting to read CSV from: {full_csv_path}")
 
-        while True:
-            repeat_variable = input("Would you like to embark on another quest for a CIK's worth of files? (yes/no): ").strip().lower()
-            if repeat_variable == "yes":
-                new_cik = input("Enter the new CIK: ").strip()
-                new_sec_url = f"https://www.sec.gov/Archives/edgar/data/{new_cik}"
-                print(f"Preparing for a new quest with CIK: {new_cik}")
-                # Here you might want to call `process_cik(new_cik)` directly or handle it in another way
-            elif repeat_variable == "no":
-                print("Thank you for your bravery in this quest. Farewell, noble seeker of knowledge!")
-                break
-            else:
-                print("Please choose 'yes' to continue your quest or 'no' to rest.")
+        if not os.path.exists(full_csv_path):
+            print(f"CSV file not found: {full_csv_path}")
+            return
+
+        with open(full_csv_path, newline='', encoding='utf-8') as csvfile:
+            reader = csv.reader(csvfile)
+            next(reader, None)  # Skip header
+            for row in reader:
+                if len(row) > 0 and row[0].isdigit() and 1 <= len(row[0]) <= 10:
+                    ciks.add(row[0])
+
+        if not ciks:
+            print(f"No valid CIKs found in {csv_file}. Check CSV format or content.")
+            return
+
+        print(f"Extracted CIKs: {ciks}")
+
+        def fetch_directory(url):
+            retries = 3
+            delay = 1
+            headers = {'User-Agent': "FORTHELULZ@anonops.com"}
+            for attempt in range(retries):
+                try:
+                    req = urllib.request.Request(url, headers=headers)
+                    with urllib.request.urlopen(req, timeout=30) as response:
+                        if response.getcode() != 200:
+                            raise urllib.error.HTTPError(url, response.getcode(), "Non-200 status", {}, None)
+                        return BeautifulSoup(response.read(), 'html.parser')
+                except (urllib.error.HTTPError, urllib.error.URLError) as e:
+                    print(f"Attempt {attempt + 1} failed for {url}: {e}")
+                    if attempt < retries - 1:
+                        time.sleep(delay * (2 ** attempt))
+            raise Exception(f"Failed to fetch {url} after {retries} retries")
+
+        def download_file(url, directory):
+            retries = 3
+            delay = 1
+            for attempt in range(retries):
+                try:
+                    headers = {'User-Agent': "FORTHELULZ@anonops.com"}
+                    req = urllib.request.Request(url, headers=headers)
+                    with urllib.request.urlopen(req, timeout=30) as response:
+                        if response.getcode() != 200:
+                            raise urllib.error.HTTPError(url, response.getcode(), "Non-200 status", {}, None)
+                        content = response.read()
+                        if len(content) == 0:
+                            raise ValueError("No content in response")
+                        filename = os.path.basename(url)
+                        full_path = os.path.join(directory, filename)
+                        with open(full_path, 'wb') as file:
+                            file.write(content)
+                        if os.path.getsize(full_path) == 0:
+                            os.remove(full_path)
+                            raise ValueError("File size is 0 after write")
+                        print(f"Downloaded: {full_path}")
+                        return True
+                except (urllib.error.HTTPError, urllib.error.URLError, ValueError) as e:
+                    print(f"Attempt {attempt + 1} failed for {url}: {e}")
+                    if attempt < retries - 1:
+                        time.sleep(delay * (2 ** attempt))
+            print(f"Failed to download {url} after {retries} retries")
+            return False
+
+        def process_cik(cik):
+            sec_url_full = f"https://www.sec.gov/Archives/edgar/data/{cik}/"
+            print(f"Embarking on the quest for {sec_url_full}...")
+            folder_name = cik
+            full_download_directory = os.path.join(base_download_dir, folder_name)
+            os.makedirs(full_download_directory, exist_ok=True)
+            print(f"Full download directory: {full_download_directory}")
+
+            soup = fetch_directory(sec_url_full)
+            links = soup.find_all('a', href=True)
+            for link in links:
+                href = link['href']
+                if href.endswith('.txt') and href.startswith(f'/Archives/edgar/data/{cik}/'):  # Strict .txt filter
+                    full_url = f"https://www.sec.gov{href}"
+                    print(f"Attempting to download: {full_url}")
+                    download_file(full_url, full_download_directory)
+
+        os.makedirs(base_download_dir, exist_ok=True)
+        header = ['CIK', 'URL', 'Download Location', 'Status']
+        rows = []
+
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            list(tqdm(executor.map(process_cik, ciks), total=len(ciks), desc="Processing CIKs"))
+
+        # Update CSV and HTML (simplified)
+        with open(csv_file, 'w', newline='') as csvfile:
+            writer = csv.writer(csvfile)
+            writer.writerow(header)
+            for cik in ciks:
+                download_loc = os.path.join(base_download_dir, cik, '*.txt') if any(os.path.exists(f) for f in glob.glob(os.path.join(base_download_dir, cik, '*.txt'))) else 'Failed'
+                rows.append([cik, f"https://www.sec.gov/Archives/edgar/data/{cik}/", download_loc, 'Success' if download_loc != 'Failed' else 'Failed'])
+            writer.writerows(rows)
+
+        html_file_name = os.path.splitext(csv_file)[0] + '_index.html'
+        with open(html_file_name, 'w', encoding='utf-8') as htmlfile:
+            htmlfile.write('<!DOCTYPE html><html><head><title>Download Index</title></head><body><table border="1">')
+            htmlfile.write('<tr>' + ''.join(f'<th>{h}</th>' for h in header) + '</tr>')
+            for row in rows:
+                htmlfile.write('<tr>')
+                for item in row:
+                    htmlfile.write(f'<td>{item}</td>' if item == 'Failed' else f'<td><a href="file://{os.path.abspath(item)}">{item}</a></td>')
+                htmlfile.write('</tr>')
+            htmlfile.write('</table></body></html>')
+        print(f"Quest completed for {len(ciks)} CIKs. CSV updated and HTML index created.")
+
     if method == 'url':
         download_from_csv(csv_file)
     elif method == 'crawl':
         download_from_crawling(csv_file)
     else:
         print("Unknown method for CSV extraction.")
+def process_cik(cik, rows=None, base_download_dir='./EDGAR/DATA'):
+    if rows is None:
+        rows = []
+    sec_url_full = f"https://www.sec.gov/Archives/edgar/data/{cik}/"
+    print(f"Embarking on the quest for {sec_url_full}...")
+    folder_name = sec_url_full.rstrip('/').split('/')[-1]
+    full_download_directory = os.path.join(base_download_dir, folder_name)
+    print(f"Full download directory: {full_download_directory} - Here lies our treasure vault")
+
+    subdirectories = scrape_subdirectories(sec_url_full)
+    if not subdirectories:
+        print(f"No hidden chambers found at {sec_url_full}. Exiting this quest.")
+        return
+
+    full_subdirectory_urls = [f"{sec_url_full.rstrip('/')}/{sub}" for sub in subdirectories]
+    
+    sanitized_file_path = 'sanitized_subdirectories.txt'
+    with open(sanitized_file_path, 'w') as sanitized_file:
+        sanitized_file.write('\n'.join(full_subdirectory_urls))
+    print(f"Sanitized list created: {sanitized_file_path} - The map to hidden chambers is drawn")
+
+    output_file_path = 'completed_subdirectories.txt'
+    if os.path.exists(output_file_path):
+        with open(output_file_path, 'r') as file:
+            completed_subdirectories = [line.strip() for line in file]
+    else:
+        completed_subdirectories = []
+
+    os.makedirs(full_download_directory, exist_ok=True)
+    print(f"Download directory created: {full_download_directory} - The vault is ready to receive its riches")
+
+    total_subdirectories = len(full_subdirectory_urls)
+    processed_subdirectories = len(completed_subdirectories)
+
+    for subdirectory in full_subdirectory_urls:
+        if subdirectory in completed_subdirectories:
+            print(f"Skipping already plundered chamber: {subdirectory}")
+            continue
+
+        print(f"Venturing into the chamber: {subdirectory}")
+        try:
+            soup = fetch_directory(subdirectory)
+            links = soup.find_all('a')
+            txt_links = [link.get('href') for link in links if link.get('href') and link.get('href').endswith('.txt')]
+            print(f"Found txt links in {subdirectory}: {txt_links} - Scrolls of lore discovered")
+            for txt_link in txt_links:
+                txt_url = "https://www.sec.gov" + txt_link
+                print(f"Downloading txt file: {txt_url} - Securing the scroll")
+                download_success = download_file(txt_url, full_download_directory)
+                download_location = os.path.join(full_download_directory, os.path.basename(txt_url)) if download_success else 'Failed'
+                rows.append([cik, txt_url, download_location, 'Success' if download_success else 'Failed'])
+                if download_success:
+                    with open(output_file_path, 'a') as completed_file:
+                        completed_file.write(subdirectory + '\n')
+                    break
+                time.sleep(0.1)
+        except Exception as e:
+            print(f"Failed to access {subdirectory}: {e} - Beware, for this path is cursed!")
+            with open('error_log.txt', 'a') as error_log_file:
+                error_log_file.write(f"Failed to access {subdirectory}: {e}\n")
+
+        processed_subdirectories += 1
+        print(f"Progress: {processed_subdirectories}/{total_subdirectories} chambers explored.")
+
+    remaining_subdirectories = [sub for sub in full_subdirectory_urls if sub not in completed_subdirectories]
+    with open(sanitized_file_path, 'w') as sanitized_file:
+        sanitized_file.write('\n'.join(remaining_subdirectories))
+
+    print("Download complete for current CIK - The quest for this treasure trove ends.")
 def fetch_directory(url):
     retries=3
     delay=1
@@ -2786,1273 +3181,1086 @@ def process_zips(url, max_retries=3, timeout=10):
                 return None
             time.sleep(2 ** attempt)
     return None
-def search_nport_swaps(zip_file, verbose=False, debug=True):
-    import tqdm, pandas as pd
+def process_tsv_file(tsv_name, row, zip_file, verbose=False):
+    """Process a single TSV file for a given row and return enriched holding_summary with all fields."""
+    import zipfile
+    import pandas as pd
+    import logging
+
+    def log_safe(msg):
+        if verbose:
+            logging.info(msg)
+
+    holding_summary = {}
+    try:
+        with zipfile.ZipFile(zip_file, 'r') as zip_ref:
+            with zip_ref.open(f'{tsv_name}.tsv') as tsvfile:
+                df = pd.read_csv(tsvfile, delimiter='\t', low_memory=False, encoding='utf-8', on_bad_lines='skip')
+                match_col = 'ACCESSION_NUMBER' if tsv_name != 'IDENTIFIERS' else 'HOLDING_ID'
+                match_value = row['ACCESSION_NUMBER'] if tsv_name != 'IDENTIFIERS' else row['HOLDING_ID']
+                if tsv_name in ['SUBMISSION', 'REGISTRANT', 'FUND_REPORTED_INFO', 'INTEREST_RATE_RISK', 'BORROWER',
+                               'BORROW_AGGREGATE', 'MONTHLY_TOTAL_RETURN']:
+                    match_row = df[df[match_col] == match_value] if match_col in df.columns else pd.DataFrame()
+                elif tsv_name == 'MONTHLY_RETURN_CAT_INSTRUMENT':
+                    match_row = df[(df['ACCESSION_NUMBER'] == row['ACCESSION_NUMBER']) & 
+                                  (df['ASSET_CAT'] == row['ASSET_CAT'])] if 'ASSET_CAT' in df.columns else pd.DataFrame()
+                elif tsv_name == 'IDENTIFIERS':
+                    match_row = df[df[match_col] == match_value] if match_col in df.columns else pd.DataFrame()
+
+                if not match_row.empty:
+                    for col in match_row.columns:
+                        prefixed_col = f"{tsv_name}_{col}"
+                        holding_summary[prefixed_col] = match_row.iloc[0][col]
+                    log_safe(f"Matched {tsv_name} for {match_col} {match_value}")
+                else:
+                    log_safe(f"No match for {tsv_name} with {match_col} {match_value}")
+    except Exception as e:
+        log_safe(f"Error processing {tsv_name}.tsv in {zip_file}: {str(e)}")
+    return holding_summary
+def search_nport_swaps(zip_file, search_terms, verbose=False, debug=False, log_file=None):
+    import os
+    import zipfile
+    import pandas as pd
+    import tqdm
+    from datetime import datetime
+    from concurrent.futures import ProcessPoolExecutor, as_completed
+    import logging
+
     summary = []
-    if verbose:
-        print(f"Starting {zip_file}")
+    
+    if verbose and log_file:
+        log_dir = os.path.dirname(log_file) or '.'
+        if log_dir and not os.path.exists(log_dir):
+            os.makedirs(log_dir, exist_ok=True)
+        logging.basicConfig(filename=log_file, level=logging.INFO, format='%(asctime)s - %(message)s', filemode='a')
+    
+    def log_safe(msg):
+        if verbose:
+            logging.info(msg)
+    
+    log_safe(f"Starting {zip_file}")
     
     try:
         base_name = os.path.basename(zip_file)
         year = base_name[:4]
         quarter_char = base_name[4]
-        quarter = {
-            'q': 1, '1': 1,
-            'w': 2, '2': 2,
-            'e': 3, '3': 3,
-            'r': 4, '4': 4
-        }.get(quarter_char.lower(), None)
+        quarter = {'q': 1, '1': 1, 'w': 2, '2': 2, 'e': 3, '3': 3, 'r': 4, '4': 4}.get(quarter_char.lower(), None)
 
         if quarter is not None:
             quarter_start_date = datetime(int(year), quarter*3 - 2, 1)
             timestamp = int(quarter_start_date.timestamp())
         else:
             timestamp = None
+            log_safe(f"Warning: Could not parse quarter from {zip_file}")
+            return summary
 
         with zipfile.ZipFile(zip_file, 'r') as zip_ref:
             if 'FUND_REPORTED_HOLDING.tsv' not in zip_ref.namelist():
-                if verbose:
-                    print(f"Warning: {zip_file} does not contain FUND_REPORTED_HOLDING.tsv")
+                log_safe(f"Warning: {zip_file} does not contain FUND_REPORTED_HOLDING.tsv")
                 return summary
 
-            chunksize = 100000  # Adjust based on memory usage
-            total_rows = 0  # Estimate total rows, this might need adjustment based on file size
+            chunksize = 100000
             with zip_ref.open('FUND_REPORTED_HOLDING.tsv') as tsvfile:
-                total_rows = sum(1 for _ in tsvfile)  # Count lines for progress estimation
+                total_rows = sum(1 for _ in tsvfile)
+                tsvfile.seek(0)
 
             with tqdm.tqdm(total=total_rows, desc=f"Processing {zip_file}", unit="row") as pbar:
-                for chunk in pd.read_csv(zip_ref.open('FUND_REPORTED_HOLDING.tsv'), delimiter='\t', chunksize=chunksize, low_memory=False):
-
-                    # Ensure 'FILENAME_TIMESTAMP' column exists, using timestamp from filename
+                for chunk in pd.read_csv(zip_ref.open('FUND_REPORTED_HOLDING.tsv'), delimiter='\t', chunksize=chunksize,
+                                       low_memory=False, encoding='utf-8', on_bad_lines='skip'):
                     if 'FILENAME_TIMESTAMP' not in chunk.columns:
-                        chunk['FILENAME_TIMESTAMP'] = f"{year}{quarter_char}"  # Add column with the year and quarter from the filename
+                        chunk['FILENAME_TIMESTAMP'] = timestamp
 
-                    # Ensure all columns are treated as strings for string operations
-                    string_columns = ['ISSUER_NAME', 'ISSUER_TITLE', 'ACCESSION_NUMBER', 'HOLDING_ID', 'FILENAME_TIMESTAMP',
-                                    'ISSUER_LEI', 'ISSUER_CUSIP', 'BALANCE', 'UNIT', 'OTHER_UNIT_DESC', 'CURRENCY_CODE',
-                                    'CURRENCY_VALUE', 'EXCHANGE_RATE', 'PERCENTAGE', 'PAYOFF_PROFILE', 'ASSET_CAT',
-                                    'OTHER_ASSET', 'ISSUER_TYPE', 'OTHER_ISSUER', 'INVESTMENT_COUNTRY',
-                                    'IS_RESTRICTED_SECURITY', 'FAIR_VALUE_LEVEL', 'DERIVATIVE_CAT']
+                    string_columns = ['ISSUER_NAME', 'ISSUER_TITLE', 'ACCESSION_NUMBER', 'HOLDING_ID', 'ISSUER_LEI',
+                                     'ISSUER_CUSIP', 'UNIT', 'OTHER_UNIT_DESC', 'CURRENCY_CODE', 'PAYOFF_PROFILE',
+                                     'ASSET_CAT', 'OTHER_ASSET', 'ISSUER_TYPE', 'OTHER_ISSUER', 'INVESTMENT_COUNTRY',
+                                     'IS_RESTRICTED_SECURITY', 'FAIR_VALUE_LEVEL', 'DERIVATIVE_CAT']
                     chunk[string_columns] = chunk[string_columns].fillna('').astype(str)
                     
-                    # Search for 'swap' or 'swp' across all columns without using lambda
-                    def contains_swap(row):
-                        return row.astype(str).str.contains('swp', case=False, regex=True, na=False).any()
+                    def contains_search_term(row):
+                        for term in search_terms:
+                            for col in string_columns:
+                                if pd.notna(row[col]) and term.lower() in str(row[col]).lower():
+                                    return True
+                        return False
                     
-                    keyword_holdings = chunk[chunk.apply(contains_swap, axis=1)]
+                    keyword_holdings = chunk[chunk.apply(contains_search_term, axis=1)]
+                    log_safe(f"Processed chunk with {len(chunk)} rows, found {len(keyword_holdings)} matches for {', '.join(search_terms)} in {zip_file}")
 
-                    if verbose:
-                        print(f"Found {len(keyword_holdings)} holdings related to 'swap' in {zip_file}")
-                    
                     if not keyword_holdings.empty:
-                        for index, row in keyword_holdings.iterrows():
-                            holding_summary = {
-                                'ACCESSION_NUMBER': row['ACCESSION_NUMBER'],
-                                'HOLDING_ID': row['HOLDING_ID'],
-                                'FILENAME_TIMESTAMP': timestamp,
-                                'ISSUER_NAME': row['ISSUER_NAME'],
-                                'ISSUER_LEI': row['ISSUER_LEI'],
-                                'ISSUER_TITLE': row['ISSUER_TITLE'],
-                                'ISSUER_CUSIP': row['ISSUER_CUSIP'],
-                                'BALANCE': row['BALANCE'],
-                                'UNIT': row['UNIT'],
-                                'OTHER_UNIT_DESC': row['OTHER_UNIT_DESC'],
-                                'CURRENCY_CODE': row['CURRENCY_CODE'],
-                                'CURRENCY_VALUE': row['CURRENCY_VALUE'],
-                                'EXCHANGE_RATE': row['EXCHANGE_RATE'],
-                                'PERCENTAGE': row['PERCENTAGE'],
-                                'PAYOFF_PROFILE': row['PAYOFF_PROFILE'],
-                                'ASSET_CAT': row['ASSET_CAT'],
-                                'OTHER_ASSET': row['OTHER_ASSET'],
-                                'ISSUER_TYPE': row['ISSUER_TYPE'],
-                                'OTHER_ISSUER': row['OTHER_ISSUER'],
-                                'INVESTMENT_COUNTRY': row['INVESTMENT_COUNTRY'],
-                                'IS_RESTRICTED_SECURITY': row['IS_RESTRICTED_SECURITY'],
-                                'FAIR_VALUE_LEVEL': row['FAIR_VALUE_LEVEL'],
-                                'DERIVATIVE_CAT': row['DERIVATIVE_CAT'],
-                            }
+                        tsv_files = ['SUBMISSION', 'REGISTRANT', 'FUND_REPORTED_INFO', 'INTEREST_RATE_RISK', 'BORROWER',
+                                    'BORROW_AGGREGATE', 'MONTHLY_TOTAL_RETURN', 'MONTHLY_RETURN_CAT_INSTRUMENT', 'IDENTIFIERS']
+                        
+                        with ProcessPoolExecutor() as executor:
+                            for index, row in keyword_holdings.iterrows():
+                                holding_summary = {
+                                    'ACCESSION_NUMBER': row['ACCESSION_NUMBER'] if 'ACCESSION_NUMBER' in row else None,
+                                    'HOLDING_ID': row['HOLDING_ID'] if 'HOLDING_ID' in row else None,
+                                    'FILENAME_TIMESTAMP': timestamp,
+                                    'FILING_DATE': None,  # To be populated from SUBMISSION_FILING_DATE
+                                    'ISSUER_NAME': row['ISSUER_NAME'] if 'ISSUER_NAME' in row else None,
+                                    'ISSUER_LEI': row['ISSUER_LEI'] if 'ISSUER_LEI' in row else None,
+                                    'ISSUER_TITLE': row['ISSUER_TITLE'] if 'ISSUER_TITLE' in row else None,
+                                    'ISSUER_CUSIP': row['ISSUER_CUSIP'] if 'ISSUER_CUSIP' in row else None,
+                                    'BALANCE': row['BALANCE'] if 'BALANCE' in row else None,
+                                    'UNIT': row['UNIT'] if 'UNIT' in row else None,
+                                    'OTHER_UNIT_DESC': row['OTHER_UNIT_DESC'] if 'OTHER_UNIT_DESC' in row else None,
+                                    'CURRENCY_CODE': row['CURRENCY_CODE'] if 'CURRENCY_CODE' in row else None,
+                                    'CURRENCY_VALUE': row['CURRENCY_VALUE'] if 'CURRENCY_VALUE' in row else None,
+                                    'EXCHANGE_RATE': row['EXCHANGE_RATE'] if 'EXCHANGE_RATE' in row else None,
+                                    'PERCENTAGE': row['PERCENTAGE'] if 'PERCENTAGE' in row else None,
+                                    'PAYOFF_PROFILE': row['PAYOFF_PROFILE'] if 'PAYOFF_PROFILE' in row else None,
+                                    'ASSET_CAT': row['ASSET_CAT'] if 'ASSET_CAT' in row else None,
+                                    'OTHER_ASSET': row['OTHER_ASSET'] if 'OTHER_ASSET' in row else None,
+                                    'ISSUER_TYPE': row['ISSUER_TYPE'] if 'ISSUER_TYPE' in row else None,
+                                    'OTHER_ISSUER': row['OTHER_ISSUER'] if 'OTHER_ISSUER' in row else None,
+                                    'INVESTMENT_COUNTRY': row['INVESTMENT_COUNTRY'] if 'INVESTMENT_COUNTRY' in row else None,
+                                    'IS_RESTRICTED_SECURITY': row['IS_RESTRICTED_SECURITY'] if 'IS_RESTRICTED_SECURITY' in row else None,
+                                    'FAIR_VALUE_LEVEL': row['FAIR_VALUE_LEVEL'] if 'FAIR_VALUE_LEVEL' in row else None,
+                                    'DERIVATIVE_CAT': row['DERIVATIVE_CAT'] if 'DERIVATIVE_CAT' in row else None,
+                                }
 
-                            # Process additional TSV files for each holding
-                            for tsv_name in ['REGISTRANT', 'FUND_REPORTED_INFO', 'INTEREST_RATE_RISK', 'BORROWER', 'BORROW_AGGREGATE', 'MONTHLY_TOTAL_RETURN', 'MONTHLY_RETURN_CAT_INSTRUMENT', 'IDENTIFIERS']:
-                                try:
-                                    with zip_ref.open(f'{tsv_name}.tsv') as tsvfile:
-                                        df = pd.read_csv(tsvfile, delimiter='\t', low_memory=False)
-                                        if tsv_name == 'REGISTRANT':
-                                            reg_row = df[df['ACCESSION_NUMBER'] == row['ACCESSION_NUMBER']]
-                                            if not reg_row.empty:
-                                                for col in ['CIK', 'REGISTRANT_NAME', 'FILE_NUM', 'LEI', 'ADDRESS1', 'ADDRESS2', 'CITY', 'STATE', 'COUNTRY', 'ZIP', 'PHONE']:
-                                                    if col in reg_row.columns:
-                                                        holding_summary[col] = reg_row.iloc[0][col]
-                                        elif tsv_name == 'FUND_REPORTED_INFO':
-                                            fund_row = df[df['ACCESSION_NUMBER'] == row['ACCESSION_NUMBER']]
-                                            if not fund_row.empty:
-                                                for col in fund_row.columns:
-                                                    if col not in holding_summary:
-                                                        holding_summary[col] = fund_row.iloc[0][col]
-                                        elif tsv_name == 'INTEREST_RATE_RISK':
-                                            intrst_rate_row = df[df['ACCESSION_NUMBER'] == row['ACCESSION_NUMBER']]
-                                            if not intrst_rate_row.empty:
-                                                for col in intrst_rate_row.columns:
-                                                    if col not in holding_summary:
-                                                        holding_summary[col] = intrst_rate_row.iloc[0][col]
-                                        elif tsv_name == 'BORROWER':
-                                            borrower_row = df[df['ACCESSION_NUMBER'] == row['ACCESSION_NUMBER']]
-                                            if not borrower_row.empty:
-                                                for col in ['NAME', 'LEI', 'AGGREGATE_VALUE']:
-                                                    if col in borrower_row.columns:
-                                                        holding_summary[f"BORROWER_{col}"] = borrower_row.iloc[0][col]
-                                        elif tsv_name == 'BORROW_AGGREGATE':
-                                            borrow_agg_row = df[df['ACCESSION_NUMBER'] == row['ACCESSION_NUMBER']]
-                                            if not borrow_agg_row.empty:
-                                                for col in ['AMOUNT', 'COLLATERAL', 'INVESTMENT_CAT', 'OTHER_DESC']:
-                                                    if col in borrow_agg_row.columns:
-                                                        holding_summary[f"BORROW_AGGREGATE_{col}"] = borrow_agg_row.iloc[0][col]
-                                        elif tsv_name == 'MONTHLY_TOTAL_RETURN':
-                                            mtr_row = df[df['ACCESSION_NUMBER'] == row['ACCESSION_NUMBER']]
-                                            if not mtr_row.empty:
-                                                for i in range(1, 4):  # 1, 2, 3 for the three months
-                                                    holding_summary[f'MONTHLY_TOTAL_RETURN_{i}'] = mtr_row.iloc[0][f'MONTHLY_TOTAL_RETURN{i}']
-                                        elif tsv_name == 'MONTHLY_RETURN_CAT_INSTRUMENT':
-                                            mrci_row = df[(df['ACCESSION_NUMBER'] == row['ACCESSION_NUMBER']) & 
-                                                        (df['ASSET_CAT'] == row['ASSET_CAT'])]
-                                            if not mrci_row.empty:
-                                                for i in range(1, 4):  # 1, 2, 3 for the three months
-                                                    for prefix in ['NET_REALIZED_GAIN', 'NET_UNREALIZED_AP']:
-                                                        holding_summary[f'{prefix}_MON{i}'] = mrci_row.iloc[0][f'{prefix}_MON{i}']
-                                        elif tsv_name == 'IDENTIFIERS':
-                                            identifiers_row = df[df['HOLDING_ID'] == row['HOLDING_ID']]
-                                            if not identifiers_row.empty:
-                                                for col in ['IDENTIFIER_ISIN', 'IDENTIFIER_TICKER', 'OTHER_IDENTIFIER', 'OTHER_IDENTIFIER_DESC']:
-                                                    if col in identifiers_row.columns:
-                                                        holding_summary[col] = identifiers_row.iloc[0][col]
+                                # Parallel TSV processing
+                                futures = [executor.submit(process_tsv_file, tsv_name, row, zip_file, verbose) 
+                                          for tsv_name in tsv_files]
+                                for future in as_completed(futures):
+                                    tsv_data = future.result()
+                                    holding_summary.update(tsv_data)
 
-                                except KeyError:
-                                    if verbose:
-                                        print(f"Could not find {tsv_name} for {row['ACCESSION_NUMBER']}")
+                                # Populate FILING_DATE from SUBMISSION
+                                if 'SUBMISSION_FILING_DATE' in holding_summary:
+                                    holding_summary['FILING_DATE'] = pd.to_datetime(holding_summary['SUBMISSION_FILING_DATE'], format='%d-%b-%Y', errors='coerce')
 
-                        # Add quarterly data
-                        if 'REPORT_DATE' in holding_summary:
-                            holding_summary['YYYYQQ'] = f"{holding_summary['REPORT_DATE'].year}Q{((holding_summary['REPORT_DATE'].month-1)//3) + 1}"
-                        else:
-                            holding_summary['YYYYQQ'] = None
+                                # Derive YYYYQQ from SUBMISSION_REPORT_ENDING_PERIOD
+                                if 'SUBMISSION_REPORT_ENDING_PERIOD' in holding_summary:
+                                    report_date = pd.to_datetime(holding_summary['SUBMISSION_REPORT_ENDING_PERIOD'], format='%d-%b-%Y', errors='coerce')
+                                    if not pd.isna(report_date):
+                                        holding_summary['YYYYQQ'] = f"{report_date.year}Q{((report_date.month-1)//3) + 1}"
+                                    else:
+                                        holding_summary['YYYYQQ'] = None
+                                elif 'FUND_REPORTED_INFO_REPORT_DATE' in holding_summary:
+                                    report_date = pd.to_datetime(holding_summary['FUND_REPORTED_INFO_REPORT_DATE'], format='%d-%b-%Y', errors='coerce')
+                                    if not pd.isna(report_date):
+                                        holding_summary['YYYYQQ'] = f"{report_date.year}Q{((report_date.month-1)//3) + 1}"
+                                    else:
+                                        holding_summary['YYYYQQ'] = None
 
-                        summary.append(holding_summary)
-                        if verbose and index % 10 == 0:  # Print status every 10 entries
-                            print(f"Processed {index} holdings for {zip_file}")
+                                summary.append(holding_summary)
+                                if verbose and index % 10 == 0:
+                                    log_safe(f"Processed {index} holdings for {zip_file}")
 
-                if debug:
-                    result = chunk.apply(contains_swap, axis=1)
-                    print(f"Type of result: {type(result)}")  # Should be pandas.Series
-                    print(f"Result dtype: {result.dtype}")  # Should be bool
-                    print(f"First few values of result:\n{result.head()}")
-                
-                if verbose:
-                    print(f"Found {len(keyword_holdings)} holdings related to 'swap' in {zip_file}")
+                    pbar.update(chunksize)
+
+                    if debug:
+                        result = chunk.apply(contains_search_term, axis=1)
+                        log_safe(f"Type of result: {type(result)}")
+                        log_safe(f"Result dtype: {result.dtype}")
+                        log_safe(f"First few values of result:\n{result.head()}")
 
     except Exception as e:
-        if verbose:
-            print(f"Error processing {zip_file}: {str(e)}")
+        log_safe(f"Error processing {zip_file}: {str(e)}")
     
     return summary
-def search_nport(search_keywords, verbose=False, search_for_swaps=False):
-    import tqdm, concurrent.futures, pandas as pd
+def search_nport(search_keywords, verbose=False):
+    import os
+    import pandas as pd
+    import tqdm
+    from datetime import datetime
+    import gc
+    import logging
+
     secnport_path = os.path.join(ROOT_DIR, "SecNport")
     os.makedirs(secnport_path, exist_ok=True)
     
+    # Get and sort ZIP files by date
     zip_files = [os.path.join(secnport_path, f) for f in os.listdir(secnport_path) if f.endswith('.zip')]
     zip_files = [os.path.normpath(path) for path in zip_files]
+    
+    def get_file_date(file):
+        base_name = os.path.basename(file)
+        year = base_name[:4]
+        quarter_char = base_name[4]
+        quarter = {'q': 1, '1': 1, 'w': 2, '2': 2, 'e': 3, '3': 3, 'r': 4, '4': 4}.get(quarter_char.lower(), None)
+        if quarter is not None:
+            return datetime(int(year), quarter*3 - 2, 1)
+        return datetime.min  # Fallback for invalid dates
+    
+    zip_files.sort(key=get_file_date)
     search_terms = [term.strip() for term in search_keywords.split(',')]
     
-    output_file = os.path.join(ROOT_DIR, f"{search_keywords.replace(',', '_')}_summary_results.csv")
+    output_file = os.path.join(ROOT_DIR, "SecNport", f"{search_keywords.replace(',', '_')}_summary_results.csv")
+    log_file = os.path.join(ROOT_DIR, "SecNport", f"{search_keywords.replace(',', '_')}_process.log")
 
-    with open(output_file, 'w', newline='') as csvfile:
-        headers = ['ACCESSION_NUMBER', 'HOLDING_ID', 'FILENAME_TIMESTAMP', 'ISSUER_NAME', 'ISSUER_LEI', 
-                   'ISSUER_TITLE', 'ISSUER_CUSIP', 'BALANCE', 'UNIT', 'OTHER_UNIT_DESC', 'CURRENCY_CODE', 
-                   'CURRENCY_VALUE', 'EXCHANGE_RATE', 'PERCENTAGE', 'PAYOFF_PROFILE', 'ASSET_CAT', 
-                   'OTHER_ASSET', 'ISSUER_TYPE', 'OTHER_ISSUER', 'INVESTMENT_COUNTRY', 
-                   'IS_RESTRICTED_SECURITY', 'FAIR_VALUE_LEVEL', 'DERIVATIVE_CAT', 
-                   'CIK', 'REGISTRANT_NAME', 'FILE_NUM', 'LEI', 'ADDRESS1', 'ADDRESS2', 'CITY', 'STATE', 
-                   'COUNTRY', 'ZIP', 'PHONE', 'YYYYQQ']
-        
-        pd.DataFrame(columns=headers).to_csv(csvfile, index=False, header=True, mode='w')
+    # Core headers from FUND_REPORTED_HOLDING and derived
+    core_headers = [
+        'ACCESSION_NUMBER', 'HOLDING_ID', 'FILENAME_TIMESTAMP', 'FILING_DATE',
+        'ISSUER_NAME', 'ISSUER_LEI', 'ISSUER_TITLE', 'ISSUER_CUSIP', 'BALANCE',
+        'UNIT', 'OTHER_UNIT_DESC', 'CURRENCY_CODE', 'CURRENCY_VALUE', 'EXCHANGE_RATE',
+        'PERCENTAGE', 'PAYOFF_PROFILE', 'ASSET_CAT', 'OTHER_ASSET', 'ISSUER_TYPE',
+        'OTHER_ISSUER', 'INVESTMENT_COUNTRY', 'IS_RESTRICTED_SECURITY', 'FAIR_VALUE_LEVEL',
+        'DERIVATIVE_CAT', 'YYYYQQ'
+    ]
 
-        if verbose:
-            with tqdm.tqdm(total=len(zip_files), desc="Files Processed", unit="file") as file_progress:
-                with ProcessPoolExecutor() as executor:
-                    futures = [executor.submit(process_ncen, file, search_terms, verbose) for file in zip_files]
+    # All fields from provided schema, prefixed by TSV source
+    all_tsv_fields = {
+        'SUBMISSION': [
+            'FILE_NUM', 'SUB_TYPE', 'IS_LAST_FILING', 'REPORT_ENDING_PERIOD', 'REPORT_DATE', 'FILING_DATE'
+        ],
+        'REGISTRANT': [
+            'CIK', 'REGISTRANT_NAME', 'FILE_NUM', 'LEI', 'ADDRESS1', 'ADDRESS2', 'CITY', 'STATE',
+            'COUNTRY', 'ZIP', 'PHONE'
+        ],
+        'FUND_REPORTED_INFO': [
+            'SERIES_NAME', 'SERIES_ID', 'SERIES_LEI', 'TOTAL_ASSETS', 'TOTAL_LIABILITIES', 'NET_ASSETS',
+            'ASSETS_ATTRBT_TO_MISC_SECURITY', 'ASSETS_INVESTED', 'BORROWING_PAY_WITHIN_1YR',
+            'CTRLD_COMPANIES_PAY_WITHIN_1YR', 'OTHER_AFFILIA_PAY_WITHIN_1YR', 'OTHER_PAY_WITHIN_1YR',
+            'BORROWING_PAY_AFTER_1YR', 'CTRLD_COMPANIES_PAY_AFTER_1YR', 'OTHER_AFFILIA_PAY_AFTER_1YR',
+            'OTHER_PAY_AFTER_1YR', 'DELAYED_DELIVERY', 'STANDBY_COMMITMENT', 'LIQUIDATION_PREFERENCE',
+            'CASH_NOT_RPTD_IN_C_OR_D', 'CREDIT_SPREAD_3MON_INVEST', 'CREDIT_SPREAD_1YR_INVEST',
+            'CREDIT_SPREAD_5YR_INVEST', 'CREDIT_SPREAD_10YR_INVEST', 'CREDIT_SPREAD_30YR_INVEST',
+            'CREDIT_SPREAD_3MON_NONINVEST', 'CREDIT_SPREAD_1YR_NONINVEST', 'CREDIT_SPREAD_5YR_NONINVEST',
+            'CREDIT_SPREAD_10YR_NONINVEST', 'CREDIT_SPREAD_30YR_NONINVEST', 'IS_NON_CASH_COLLATERAL',
+            'NET_REALIZE_GAIN_NONDERIV_MON1', 'NET_UNREALIZE_AP_NONDERIV_MON1',
+            'NET_REALIZE_GAIN_NONDERIV_MON2', 'NET_UNREALIZE_AP_NONDERIV_MON2',
+            'NET_REALIZE_GAIN_NONDERIV_MON3', 'NET_UNREALIZE_AP_NONDERIV_MON3',
+            'SALES_FLOW_MON1', 'REINVESTMENT_FLOW_MON1', 'REDEMPTION_FLOW_MON1',
+            'SALES_FLOW_MON2', 'REINVESTMENT_FLOW_MON2', 'REDEMPTION_FLOW_MON2',
+            'SALES_FLOW_MON3', 'REINVESTMENT_FLOW_MON3', 'REDEMPTION_FLOW_MON3'
+        ],
+        'INTEREST_RATE_RISK': [
+            'INTEREST_RATE_RISK_ID', 'CURRENCY_CODE', 'INTRST_RATE_CHANGE_3MON_DV01',
+            'INTRST_RATE_CHANGE_1YR_DV01', 'INTRST_RATE_CHANGE_5YR_DV01', 'INTRST_RATE_CHANGE_10YR_DV01',
+            'INTRST_RATE_CHANGE_30YR_DV01', 'INTRST_RATE_CHANGE_3MON_DV100', 'INTRST_RATE_CHANGE_1YR_DV100',
+            'INTRST_RATE_CHANGE_5YR_DV100', 'INTRST_RATE_CHANGE_10YR_DV100', 'INTRST_RATE_CHANGE_30YR_DV100'
+        ],
+        'BORROWER': [
+            'BORROWER_ID', 'NAME', 'LEI', 'AGGREGATE_VALUE'
+        ],
+        'BORROW_AGGREGATE': [
+            'BORROW_AGGREGATE_ID', 'AMOUNT', 'COLLATERAL', 'INVESTMENT_CAT', 'OTHER_DESC'
+        ],
+        'MONTHLY_TOTAL_RETURN': [
+            'MONTHLY_TOTAL_RETURN_ID', 'CLASS_ID', 'MONTHLY_TOTAL_RETURN1', 'MONTHLY_TOTAL_RETURN2',
+            'MONTHLY_TOTAL_RETURN3'
+        ],
+        'MONTHLY_RETURN_CAT_INSTRUMENT': [
+            'ASSET_CAT', 'INSTRUMENT_KIND', 'NET_REALIZED_GAIN_MON1', 'NET_UNREALIZED_AP_MON1',
+            'NET_REALIZED_GAIN_MON2', 'NET_UNREALIZED_AP_MON2', 'NET_REALIZED_GAIN_MON3',
+            'NET_UNREALIZED_AP_MON3'
+        ],
+        'IDENTIFIERS': [
+            'IDENTIFIERS_ID', 'IDENTIFIER_ISIN', 'IDENTIFIER_TICKER', 'OTHER_IDENTIFIER', 'OTHER_IDENTIFIER_DESC'
+        ]
+    }
 
-                    for future in concurrent.futures.as_completed(futures):
-                        try:
-                            results = future.result()
-                            for date, item in results:
-                                df = pd.DataFrame([item])
-                                df.to_csv(csvfile, index=False, header=False, mode='a')
-                                if verbose:
-                                    print(f"Wrote item with date {date} to CSV")
-                        except Exception as e:
-                            if verbose:
-                                print(f"An error occurred while processing a file: {str(e)}")
-                        finally:
-                            if verbose:
-                                file_progress.update(1)
+    # Build full headers: core + prefixed TSV fields
+    headers = core_headers.copy()
+    for tsv, fields in all_tsv_fields.items():
+        for field in fields:
+            prefixed = f"{tsv}_{field}"
+            if prefixed not in headers:
+                headers.append(prefixed)
 
-    gc.collect()  # Memory management
-def search_ncen_data(zip_file, verbose=False, debug=True):
-    import tqdm, pandas as pd
-    from collections import defaultdict
+    # Initialize CSV with all headers and log the action
+    pd.DataFrame(columns=headers).to_csv(output_file, index=False, header=True, mode='w', encoding='utf-8')
+    if verbose and log_file:
+        logging.basicConfig(filename=log_file, level=logging.INFO, format='%(asctime)s - %(message)s')
+        logging.info(f"Initialized CSV with {len(headers)} headers: {output_file}")
+
+    # Process ZIP files sequentially
+    for zip_file in tqdm.tqdm(zip_files, desc="Files Processed", unit="file"):
+        try:
+            results = search_nport_swaps(zip_file, search_terms, verbose, log_file=log_file)
+            if results:
+                df = pd.DataFrame(results)
+                df = df.reindex(columns=headers, fill_value=None)
+                df.to_csv(output_file, index=False, header=False, mode='a', encoding='utf-8')
+                if verbose and log_file:
+                    logging.info(f"Wrote {len(df)} items to CSV for {zip_file} (total columns: {len(df.columns)})")
+        except Exception as e:
+            if verbose and log_file:
+                logging.info(f"An error occurred while processing {zip_file}: {str(e)}")
+
+    gc.collect()
+    return output_file
+def process_ncen_tsv_file(tsv_name, row, zip_file, verbose=False):
+    """Process a single N-CEN TSV file for a given row and return enriched fund_summary with all fields."""
     import zipfile
+    import pandas as pd
+    import logging
 
-    all_data = defaultdict(list)
-    if verbose:
-        print(f"Starting to parse NCEN data for {zip_file}")
+    def log_safe(msg):
+        if verbose:
+            logging.info(msg)
 
+    fund_summary = {}
     try:
         with zipfile.ZipFile(zip_file, 'r') as zip_ref:
-            dataset_files = {
-                'SUBMISSION': 'SUBMISSION.tsv',
-                'REGISTRANT': 'REGISTRANT.tsv',
-                'REGISTRANT_WEBSITE': 'REGISTRANT_WEBSITE.tsv',
-                'LOCATION_BOOKS_RECORD': 'LOCATION_BOOKS_RECORD.tsv',
-                'TERMINATED_ORGANIZATION': 'TERMINATED_ORGANIZATION.tsv',
-                'DIRECTOR': 'DIRECTOR.tsv',
-                'DIRECTOR_FILE_NUMBER': 'DIRECTOR_FILE_NUMBER.tsv',
-                'CHIEF_COMPLIANCE_OFFICER': 'CHIEF_COMPLIANCE_OFFICER.tsv',
-                'CCO_EMPLOYER': 'CCO_EMPLOYER.tsv',
-                'REGISTRANT_REPORTING_SERIES': 'REGISTRANT_REPORTING_SERIES.tsv',
-                'RELEASE_NUMBER': 'RELEASE_NUMBER.tsv',
-                'PRINCIPAL_UNDERWRITER': 'PRINCIPAL_UNDERWRITER.tsv',
-                'PUBLIC_ACCOUNTANT': 'PUBLIC_ACCOUNTANT.tsv',
-                'VALUATION_METHOD_CHANGE': 'VALUATION_METHOD_CHANGE.tsv',
-                'VALUATION_METHOD_CHANGE_SERIES': 'VALUATION_METHOD_CHANGE_SERIES.tsv',
-                'FUND_REPORTED_INFO': 'FUND_REPORTED_INFO.tsv',
-                'SHARES_OUTSTANDING': 'SHARES_OUTSTANDING.tsv',
-                'FEEDER_FUNDS': 'FEEDER_FUNDS.tsv',
-                'MASTER_FUNDS': 'MASTER_FUNDS.tsv',
-                'FOREIGN_INVESTMENT': 'FOREIGN_INVESTMENT.tsv',
-                'SECURITY_LENDING': 'SECURITY_LENDING.tsv',
-                'SEC_LENDING_INDEMNITY_PROVIDER': 'SEC_LENDING_INDEMNITY_PROVIDER.tsv',
-                'COLLATERAL_MANAGER': 'COLLATERAL_MANAGER.tsv',
-                'ADVISER': 'ADVISER.tsv',
-                'TRANSFER_AGENT': 'TRANSFER_AGENT.tsv',
-                'PRICING_SERVICE': 'PRICING_SERVICE.tsv',
-                'CUSTODIAN': 'CUSTODIAN.tsv',
-                'SHAREHOLDER_SERVICING_AGENT': 'SHAREHOLDER_SERVICING_AGENT.tsv',
-                'ADMIN': 'ADMIN.tsv',
-                'BROKER_DEALER': 'BROKER_DEALER.tsv',
-                'BROKER': 'BROKER.tsv',
-                'PRINCIPAL_TRANSACTION': 'PRINCIPAL_TRANSACTION.tsv',
-                'LINE_OF_CREDIT_DETAIL': 'LINE_OF_CREDIT_DETAIL.tsv',
-                'LINE_OF_CREDIT_INSTITUTION': 'LINE_OF_CREDIT_INSTITUTION.tsv',
-                'CREDIT_USER': 'CREDIT_USER.tsv',
-                'INTER_FUND_LENDING_DETAIL': 'INTER_FUND_LENDING_DETAIL.tsv',
-                'INTER_FUND_BORROWING_DETAIL': 'INTER_FUND_BORROWING_DETAIL.tsv',
-                'SECURITY_RELATED_ITEM': 'SECURITY_RELATED_ITEM.tsv',
-                'RIGHTS_OFFERING_FUND': 'RIGHTS_OFFERING_FUND.tsv',
-                'LONGTERM_DEBT_DEFAULT': 'LONGTERM_DEBT_DEFAULT.tsv',
-                'DIVIDENDS_IN_ARREAR': 'DIVIDENDS_IN_ARREAR.tsv',
-                'SECURITY_EXCHANGE': 'SECURITY_EXCHANGE.tsv',
-                'AUTHORIZED_PARTICIPANT': 'AUTHORIZED_PARTICIPANT.tsv',
-                'ETF': 'ETF.tsv',
-                'DEPOSITOR': 'DEPOSITOR.tsv',
-                'UIT_ADMIN': 'UIT_ADMIN.tsv',
-                'UIT': 'UIT.tsv',
-                'SERIES_CIK': 'SERIES_CIK.tsv',
-                'SPONSOR': 'SPONSOR.tsv',
-                'TRUSTEE': 'TRUSTEE.tsv',
-                'CONTRACT_SECURITY': 'CONTRACT_SECURITY.tsv',
-                'DIVESTMENT': 'DIVESTMENT.tsv',
-                'REGISTRANT_HELDS_SECURITY': 'REGISTRANT_HELDS_SECURITY.tsv'
-            }
+            with zip_ref.open(f'{tsv_name}.tsv') as tsvfile:
+                df = pd.read_csv(tsvfile, delimiter='\t', low_memory=False)
+                # Handle TSVs with ACCESSION_NUMBER (e.g., SUBMISSION, REGISTRANT)
+                if tsv_name in ['SUBMISSION', 'REGISTRANT', 'REGISTRANT_WEBSITE', 'LOCATION_BOOKS_RECORD',
+                                'TERMINATED_ORGANIZATION', 'DIRECTOR', 'DIRECTOR_FILE_NUMBER', 'CHIEF_COMPLIANCE_OFFICER',
+                                'CCO_EMPLOYER', 'REGISTRANT_REPORTING_SERIES', 'RELEASE_NUMBER', 'PRINCIPAL_UNDERWRITER',
+                                'PUBLIC_ACCOUNTANT', 'VALUATION_METHOD_CHANGE', 'VALUATION_METHOD_CHANGE_SERIES',
+                                'UIT', 'SERIES_CIK', 'SPONSOR', 'TRUSTEE', 'CONTRACT_SECURITY', 'DIVESTMENT',
+                                'REGISTRANT_HELDS_SECURITY', 'DEPOSITOR', 'UIT_ADMIN']:
+                    match_row = df[df['ACCESSION_NUMBER'] == row['ACCESSION_NUMBER']]
+                    if not match_row.empty:
+                        for col in match_row.columns:
+                            prefixed_col = f"{tsv_name}_{col}"
+                            fund_summary[prefixed_col] = match_row.iloc[0][col]
+                # Handle TSVs with FUND_ID (e.g., FUND_REPORTED_INFO, SHARES_OUTSTANDING)
+                elif tsv_name in ['FUND_REPORTED_INFO', 'SHARES_OUTSTANDING', 'FEEDER_FUNDS', 'MASTER_FUNDS',
+                                  'FOREIGN_INVESTMENT', 'SECURITY_LENDING', 'SEC_LENDING_INDEMNITY_PROVIDER',
+                                  'COLLATERAL_MANAGER', 'ADVISER', 'TRANSFER_AGENT', 'PRICING_SERVICE', 'CUSTODIAN',
+                                  'SHAREHOLDER_SERVICING_AGENT', 'ADMIN', 'BROKER_DEALER', 'BROKER', 'PRINCIPAL_TRANSACTION',
+                                  'LINE_OF_CREDIT_DETAIL', 'LINE_OF_CREDIT_INSTITUTION', 'CREDIT_USER',
+                                  'INTER_FUND_LENDING_DETAIL', 'INTER_FUND_BORROWING_DETAIL', 'SECURITY_RELATED_ITEM',
+                                  'RIGHTS_OFFERING_FUND', 'LONGTERM_DEBT_DEFAULT', 'DIVIDENDS_IN_ARREAR', 'SECURITY_EXCHANGE',
+                                  'AUTHORIZED_PARTICIPANT', 'ETF']:
+                    match_row = df[df['FUND_ID'] == row['FUND_ID']]
+                    if not match_row.empty:
+                        for col in match_row.columns:
+                            prefixed_col = f"{tsv_name}_{col}"
+                            fund_summary[prefixed_col] = match_row.iloc[0][col]
+    except KeyError:
+        if verbose:
+            log_safe(f"Could not find {tsv_name} for ACCESSION_NUMBER {row['ACCESSION_NUMBER']} or FUND_ID {row.get('FUND_ID', 'N/A')} in {zip_file}")
+    return fund_summary
+def search_ncen_swaps(zip_file, search_terms, verbose=False, debug=False, log_file=None):
+    import os
+    import zipfile
+    import pandas as pd
+    import tqdm
+    from datetime import datetime
+    from concurrent.futures import ProcessPoolExecutor, as_completed
+    import logging
 
-            for dataset_name, file_name in dataset_files.items():
-                if file_name in zip_ref.namelist():
-                    chunksize = 100000  # Adjust based on memory usage
-                    total_rows = 0
-                    with zip_ref.open(file_name) as tsvfile:
-                        total_rows = sum(1 for _ in tsvfile)  # Count lines for progress estimation
+    summary = []
+    
+    # Set up logging
+    if verbose and log_file:
+        logging.basicConfig(filename=log_file, level=logging.INFO, format='%(asctime)s - %(message)s')
+    
+    def log_safe(msg):
+        if verbose:
+            logging.info(msg)
+    
+    log_safe(f"Starting {zip_file}")
+    
+    try:
+        base_name = os.path.basename(zip_file)
+        year = base_name[:4]
+        quarter_char = base_name[4]
+        quarter = {'q': 1, '1': 1, 'w': 2, '2': 2, 'e': 3, '3': 3, 'r': 4, '4': 4}.get(quarter_char.lower(), None)
 
-                    with tqdm.tqdm(total=total_rows, desc=f"Processing {file_name}", unit="row") as pbar:
-                        for chunk in pd.read_csv(zip_ref.open(file_name), delimiter='\t', chunksize=chunksize, low_memory=False):
-                            # Assuming all fields are strings or can be treated as such for simplicity
-                            chunk = chunk.fillna('').astype(str)
-                            
-                            # Specific parsing for each dataset
-                            if dataset_name == 'SUBMISSION':
-                                for index, row in chunk.iterrows():
-                                    submission_data = {
-                                        'ACCESSION_NUMBER': row['ACCESSION_NUMBER'],
-                                        'SUBMISSION_TYPE': row['SUBMISSION_TYPE'],
-                                        'CIK': row['CIK'],
-                                        'FILING_DATE': row['FILING_DATE'],
-                                        'REPORT_ENDING_PERIOD': row['REPORT_ENDING_PERIOD'],
-                                        'IS_REPORT_PERIOD_LT_12MONTH': row['IS_REPORT_PERIOD_LT_12MONTH'],
-                                        'FILE_NUM': row['FILE_NUM'],
-                                        'REGISTRANT_SIGNED_NAME': row['REGISTRANT_SIGNED_NAME'],
-                                        'DATE_SIGNED': row['DATE_SIGNED'],
-                                        'SIGNATURE': row['SIGNATURE'],
-                                        'TITLE': row['TITLE'],
-                                        'IS_LEGAL_PROCEEDINGS': row['IS_LEGAL_PROCEEDINGS'],
-                                        'IS_PROVISION_FINANCIAL_SUPPORT': row['IS_PROVISION_FINANCIAL_SUPPORT'],
-                                        'IS_IPA_REPORT_INTERNAL_CONTROL': row['IS_IPA_REPORT_INTERNAL_CONTROL'],
-                                        'IS_CHANGE_ACC_PRINCIPLES': row['IS_CHANGE_ACC_PRINCIPLES'],
-                                        'IS_INFO_REQUIRED_EO': row['IS_INFO_REQUIRED_EO'],
-                                        'IS_OTHER_INFO_REQUIRED': row['IS_OTHER_INFO_REQUIRED'],
-                                        'IS_MATERIAL_AMENDMENTS': row['IS_MATERIAL_AMENDMENTS'],
-                                        'IS_INST_DEFINING_RIGHTS': row['IS_INST_DEFINING_RIGHTS'],
-                                        'IS_NEW_OR_AMENDED_INV_ADV_CONT': row['IS_NEW_OR_AMENDED_INV_ADV_CONT'],
-                                        'IS_INFO_ITEM405': row['IS_INFO_ITEM405'],
-                                        'IS_CODE_OF_ETHICS': row['IS_CODE_OF_ETHICS']
-                                    }
-                                    all_data[dataset_name].append(submission_data)
-                                    pbar.update(1)
-                            
-                            elif dataset_name == 'REGISTRANT':
-                                for index, row in chunk.iterrows():
-                                    registrant_data = {
-                                        'ACCESSION_NUMBER': row['ACCESSION_NUMBER'],
-                                        'REGISTRANT_NAME': row['REGISTRANT_NAME'],
-                                        'FILE_NUM': row['FILE_NUM'],
-                                        'CIK': row['CIK'],
-                                        'LEI': row['LEI'],
-                                        'ADDRESS1': row['ADDRESS1'],
-                                        'ADDRESS2': row['ADDRESS2'],
-                                        'CITY': row['CITY'],
-                                        'STATE': row['STATE'],
-                                        'COUNTRY': row['COUNTRY'],
-                                        'ZIP': row['ZIP'],
-                                        'PHONE': row['PHONE'],
-                                        'IS_FIRST_FILING': row['IS_FIRST_FILING'],
-                                        'IS_LAST_FILING': row['IS_LAST_FILING'],
-                                        'IS_FAMILY_INVESTMENT_COMPANY': row['IS_FAMILY_INVESTMENT_COMPANY'],
-                                        'FAMILY_INVESTMENT_COMPANY_NAME': row['FAMILY_INVESTMENT_COMPANY_NAME'],
-                                        'INVESTMENT_COMPANY_TYPE': row['INVESTMENT_COMPANY_TYPE'],
-                                        'TOTAL_SERIES': row['TOTAL_SERIES'],
-                                        'IS_REGISTERED_UNDER_ACT_1933': row['IS_REGISTERED_UNDER_ACT_1933'],
-                                        'HAS_SECURITY_HOLDER_VOTE': row['HAS_SECURITY_HOLDER_VOTE'],
-                                        'HAS_LEGAL_PROCEEDING': row['HAS_LEGAL_PROCEEDING'],
-                                        'IS_PROCEEDING_TERMINATED': row['IS_PROCEEDING_TERMINATED'],
-                                        'IS_FIDELITY_BOND_CLAIMED': row['IS_FIDELITY_BOND_CLAIMED'],
-                                        'FIDELITY_BOND_CLAIMED_AMOUNT': row['FIDELITY_BOND_CLAIMED_AMOUNT'],
-                                        'HAS_DIRECTOR_INSURANCE_POLICY': row['HAS_DIRECTOR_INSURANCE_POLICY'],
-                                        'HAS_DIRECTOR_FILED_CLAIM': row['HAS_DIRECTOR_FILED_CLAIM'],
-                                        'FINANCIAL_SUPPORT_2REGISTRANT': row['FINANCIAL_SUPPORT_2REGISTRANT'],
-                                        'IS_EXEMPTIVE_ORDER': row['IS_EXEMPTIVE_ORDER'],
-                                        'IS_UNDERWRITER_HIRED_OR_FIRED': row['IS_UNDERWRITER_HIRED_OR_FIRED'],
-                                        'IS_PUB_ACCOUNTANT_CHANGED': row['IS_PUB_ACCOUNTANT_CHANGED'],
-                                        'IS_MATERIAL_WEAKNESS_NOTED': row['IS_MATERIAL_WEAKNESS_NOTED'],
-                                        'IS_ACCT_OPINION_QUALIFIED': row['IS_ACCT_OPINION_QUALIFIED'],
-                                        'IS_VALUE_METHOD_CHANGED': row['IS_VALUE_METHOD_CHANGED'],
-                                        'IS_ACCT_PRINCIPLE_CHANGED': row['IS_ACCT_PRINCIPLE_CHANGED'],
-                                        'IS_NAV_ERROR_CORRECTED': row['IS_NAV_ERROR_CORRECTED'],
-                                        'ANY_DIVIDEND_PAYMENT': row['ANY_DIVIDEND_PAYMENT']
-                                    }
-                                    all_data[dataset_name].append(registrant_data)
-                                    pbar.update(1)
-                            
-                            elif dataset_name == 'REGISTRANT_WEBSITE':
-                                for index, row in chunk.iterrows():
-                                    website_data = {
-                                        'ACCESSION_NUMBER': row['ACCESSION_NUMBER'],
-                                        'WEBPAGE': row['WEBPAGE']
-                                    }
-                                    all_data[dataset_name].append(website_data)
-                                    pbar.update(1)
-                            
-                            elif dataset_name == 'LOCATION_BOOKS_RECORD':
-                                for index, row in chunk.iterrows():
-                                    books_record_data = {
-                                        'ACCESSION_NUMBER': row['ACCESSION_NUMBER'],
-                                        'OFFICE_NAME': row['OFFICE_NAME'],
-                                        'ADDRESS1': row['ADDRESS1'],
-                                        'ADDRESS2': row['ADDRESS2'],
-                                        'CITY': row['CITY'],
-                                        'STATE': row['STATE'],
-                                        'COUNTRY': row['COUNTRY'],
-                                        'ZIP': row['ZIP'],
-                                        'PHONE': row['PHONE'],
-                                        'BOOKS_RECORDS_DESC': row['BOOKS_RECORDS_DESC']
-                                    }
-                                    all_data[dataset_name].append(books_record_data)
-                                    pbar.update(1)
-                            
-                            elif dataset_name == 'TERMINATED_ORGANIZATION':
-                                for index, row in chunk.iterrows():
-                                    terminated_org_data = {
-                                        'ACCESSION_NUMBER': row['ACCESSION_NUMBER'],
-                                        'SERIES_NAME': row['SERIES_NAME'],
-                                        'SERIES_ID': row['SERIES_ID'],
-                                        'TERMINATION_DATE': row['TERMINATION_DATE']
-                                    }
-                                    all_data[dataset_name].append(terminated_org_data)
-                                    pbar.update(1)
-                            
-                            elif dataset_name == 'DIRECTOR':
-                                for index, row in chunk.iterrows():
-                                    director_data = {
-                                        'ACCESSION_NUMBER': row['ACCESSION_NUMBER'],
-                                        'DIRECTOR_SEQNUM': row['DIRECTOR_SEQNUM'],
-                                        'DIRECTOR_NAME': row['DIRECTOR_NAME'],
-                                        'CRD_NUMBER': row['CRD_NUMBER'],
-                                        'IS_INTERESTED_PERSON': row['IS_INTERESTED_PERSON']
-                                    }
-                                    all_data[dataset_name].append(director_data)
-                                    pbar.update(1)
-                            
-                            elif dataset_name == 'DIRECTOR_FILE_NUMBER':
-                                for index, row in chunk.iterrows():
-                                    director_file_data = {
-                                        'ACCESSION_NUMBER': row['ACCESSION_NUMBER'],
-                                        'DIRECTOR_SEQNUM': row['DIRECTOR_SEQNUM'],
-                                        'FILE_NUMBER': row['FILE_NUMBER']
-                                    }
-                                    all_data[dataset_name].append(director_file_data)
-                                    pbar.update(1)
-                            
-                            elif dataset_name == 'CHIEF_COMPLIANCE_OFFICER':
-                                for index, row in chunk.iterrows():
-                                    cco_data = {
-                                        'ACCESSION_NUMBER': row['ACCESSION_NUMBER'],
-                                        'CCO_SEQNUM': row['CCO_SEQNUM'],
-                                        'CCO_NAME': row['CCO_NAME'],
-                                        'CRD_NUMBER': row['CRD_NUMBER'],
-                                        'CCO_ADDRESS1': row['CCO_ADDRESS1'],
-                                        'CCO_ADDRESS2': row['CCO_ADDRESS2'],
-                                        'CCO_CITY': row['CCO_CITY'],
-                                        'STATE': row['STATE'],
-                                        'COUNTRY': row['COUNTRY'],
-                                        'CCO_ZIP': row['CCO_ZIP'],
-                                        'IS_CHANGED_SINCE_LAST_FILING': row['IS_CHANGED_SINCE_LAST_FILING']
-                                    }
-                                    all_data[dataset_name].append(cco_data)
-                                    pbar.update(1)
+        if quarter is not None:
+            quarter_start_date = datetime(int(year), quarter*3 - 2, 1)
+            timestamp = int(quarter_start_date.timestamp())
+        else:
+            timestamp = None
+            log_safe(f"Warning: Could not parse quarter from {zip_file}")
+            return summary
 
-                            elif dataset_name == 'CCO_EMPLOYER':
-                                for index, row in chunk.iterrows():
-                                    cco_employer_data = {
-                                        'ACCESSION_NUMBER': row['ACCESSION_NUMBER'],
-                                        'CCO_SEQNUM': row['CCO_SEQNUM'],
-                                        'CCO_EMPLOYER_NAME': row['CCO_EMPLOYER_NAME'],
-                                        'CCO_EMPLOYER_ID': row['CCO_EMPLOYER_ID']
-                                    }
-                                    all_data[dataset_name].append(cco_employer_data)
-                                    pbar.update(1)
+        with zipfile.ZipFile(zip_file, 'r') as zip_ref:
+            if 'FUND_REPORTED_INFO.tsv' not in zip_ref.namelist():
+                log_safe(f"Warning: {zip_file} does not contain FUND_REPORTED_INFO.tsv")
+                return summary
 
-                            elif dataset_name == 'REGISTRANT_REPORTING_SERIES':
-                                for index, row in chunk.iterrows():
-                                    series_report_data = {
-                                        'ACCESSION_NUMBER': row['ACCESSION_NUMBER'],
-                                        'SOURCE': row['SOURCE'],
-                                        'SERIES_NAME': row['SERIES_NAME'],
-                                        'SERIES_ID': row['SERIES_ID']
-                                    }
-                                    all_data[dataset_name].append(series_report_data)
-                                    pbar.update(1)
+            chunksize = 100000
+            with zip_ref.open('FUND_REPORTED_INFO.tsv') as tsvfile:
+                total_rows = sum(1 for _ in tsvfile)
 
-                            elif dataset_name == 'RELEASE_NUMBER':
-                                for index, row in chunk.iterrows():
-                                    release_number_data = {
-                                        'ACCESSION_NUMBER': row['ACCESSION_NUMBER'],
-                                        'RELEASE_NUMBER': row['RELEASE_NUMBER']
-                                    }
-                                    all_data[dataset_name].append(release_number_data)
-                                    pbar.update(1)
+            with tqdm.tqdm(total=total_rows, desc=f"Processing {zip_file}", unit="row") as pbar:
+                for chunk in pd.read_csv(zip_ref.open('FUND_REPORTED_INFO.tsv'), delimiter='\t', chunksize=chunksize, low_memory=False):
+                    if 'FILENAME_TIMESTAMP' not in chunk.columns:
+                        chunk['FILENAME_TIMESTAMP'] = timestamp
 
-                            elif dataset_name == 'PRINCIPAL_UNDERWRITER':
-                                for index, row in chunk.iterrows():
-                                    underwriter_data = {
-                                        'ACCESSION_NUMBER': row['ACCESSION_NUMBER'],
-                                        'UNDERWRITER_NAME': row['UNDERWRITER_NAME'],
-                                        'FILE_NUM': row['FILE_NUM'],
-                                        'CRD_NUM': row['CRD_NUM'],
-                                        'UNDERWRITER_LEI': row['UNDERWRITER_LEI'],
-                                        'STATE': row['STATE'],
-                                        'COUNTRY': row['COUNTRY'],
-                                        'IS_AFFILIATED': row['IS_AFFILIATED']
-                                    }
-                                    all_data[dataset_name].append(underwriter_data)
-                                    pbar.update(1)
+                    string_columns = ['FUND_ID', 'FUND_NAME', 'SERIES_ID', 'LEI', 'ACCESSION_NUMBER']
+                    chunk[string_columns] = chunk[string_columns].fillna('').astype(str)
+                    
+                    def contains_search_term(row):
+                        for term in search_terms:
+                            if row.astype(str).str.contains(term, case=False, regex=True, na=False).any():
+                                return True
+                        return False
+                    
+                    keyword_funds = chunk[chunk.apply(contains_search_term, axis=1)]
 
-                            elif dataset_name == 'PUBLIC_ACCOUNTANT':
-                                for index, row in chunk.iterrows():
-                                    accountant_data = {
-                                        'ACCESSION_NUMBER': row['ACCESSION_NUMBER'],
-                                        'PUB_ACCOUNTANT_NAME': row['PUB_ACCOUNTANT_NAME'],
-                                        'PCAOB_NUM': row['PCAOB_NUM'],
-                                        'PUB_ACCOUNTANT_LEI': row['PUB_ACCOUNTANT_LEI'],
-                                        'STATE': row['STATE'],
-                                        'COUNTRY': row['COUNTRY']
-                                    }
-                                    all_data[dataset_name].append(accountant_data)
-                                    pbar.update(1)
+                    log_safe(f"Found {len(keyword_funds)} funds related to {', '.join(search_terms)} in chunk of {zip_file}")
+                    
+                    if not keyword_funds.empty:
+                        tsv_files = [
+                            'SUBMISSION', 'REGISTRANT', 'REGISTRANT_WEBSITE', 'LOCATION_BOOKS_RECORD',
+                            'TERMINATED_ORGANIZATION', 'DIRECTOR', 'DIRECTOR_FILE_NUMBER', 'CHIEF_COMPLIANCE_OFFICER',
+                            'CCO_EMPLOYER', 'REGISTRANT_REPORTING_SERIES', 'RELEASE_NUMBER', 'PRINCIPAL_UNDERWRITER',
+                            'PUBLIC_ACCOUNTANT', 'VALUATION_METHOD_CHANGE', 'VALUATION_METHOD_CHANGE_SERIES',
+                            'FUND_REPORTED_INFO', 'SHARES_OUTSTANDING', 'FEEDER_FUNDS', 'MASTER_FUNDS',
+                            'FOREIGN_INVESTMENT', 'SECURITY_LENDING', 'SEC_LENDING_INDEMNITY_PROVIDER',
+                            'COLLATERAL_MANAGER', 'ADVISER', 'TRANSFER_AGENT', 'PRICING_SERVICE', 'CUSTODIAN',
+                            'SHAREHOLDER_SERVICING_AGENT', 'ADMIN', 'BROKER_DEALER', 'BROKER', 'PRINCIPAL_TRANSACTION',
+                            'LINE_OF_CREDIT_DETAIL', 'LINE_OF_CREDIT_INSTITUTION', 'CREDIT_USER',
+                            'INTER_FUND_LENDING_DETAIL', 'INTER_FUND_BORROWING_DETAIL', 'SECURITY_RELATED_ITEM',
+                            'RIGHTS_OFFERING_FUND', 'LONGTERM_DEBT_DEFAULT', 'DIVIDENDS_IN_ARREAR', 'SECURITY_EXCHANGE',
+                            'AUTHORIZED_PARTICIPANT', 'ETF', 'DEPOSITOR', 'UIT_ADMIN', 'UIT', 'SERIES_CIK',
+                            'SPONSOR', 'TRUSTEE', 'CONTRACT_SECURITY', 'DIVESTMENT', 'REGISTRANT_HELDS_SECURITY'
+                        ]
+                        
+                        with ProcessPoolExecutor() as executor:
+                            for index, row in keyword_funds.iterrows():
+                                fund_summary = {
+                                    'FUND_ID': row['FUND_ID'],
+                                    'FUND_NAME': row['FUND_NAME'],
+                                    'SERIES_ID': row['SERIES_ID'],
+                                    'FILENAME_TIMESTAMP': timestamp,
+                                    'FILING_DATE': None,  # Populated from SUBMISSION.tsv
+                                    'ACCESSION_NUMBER': row['ACCESSION_NUMBER'],
+                                    'IS_ETF': row.get('IS_ETF', ''),
+                                    'IS_ETMF': row.get('IS_ETMF', ''),
+                                    'IS_INDEX': row.get('IS_INDEX', ''),
+                                    'IS_FUND_OF_FUND': row.get('IS_FUND_OF_FUND', ''),
+                                    'IS_MASTER_FEEDER': row.get('IS_MASTER_FEEDER', ''),
+                                    'IS_MONEY_MARKET': row.get('IS_MONEY_MARKET', ''),
+                                    'IS_TARGET_DATE': row.get('IS_TARGET_DATE', ''),
+                                    'IS_UNDERLYING_FUND': row.get('IS_UNDERLYING_FUND', ''),
+                                    'LEI': row.get('LEI', '')
+                                }
 
-                            elif dataset_name == 'VALUATION_METHOD_CHANGE':
-                                for index, row in chunk.iterrows():
-                                    valuation_change_data = {
-                                        'ACCESSION_NUMBER': row['ACCESSION_NUMBER'],
-                                        'VALUATION_METHOD_CHANGE_SEQNUM': row['VALUATION_METHOD_CHANGE_SEQNUM'],
-                                        'DATE_OF_CHANGE': row['DATE_OF_CHANGE'],
-                                        'CHANGE_EXPLANATION': row['CHANGE_EXPLANATION'],
-                                        'ASSET_TYPE': row['ASSET_TYPE'],
-                                        'ASSET_TYPE_OTHER_DESC': row['ASSET_TYPE_OTHER_DESC'],
-                                        'INVESTMENT_TYPE': row['INVESTMENT_TYPE'],
-                                        'STATUTORY_REGULATORY_BASIS': row['STATUTORY_REGULATORY_BASIS']
-                                    }
-                                    all_data[dataset_name].append(valuation_change_data)
-                                    pbar.update(1)
+                                # Parallel TSV processing
+                                futures = [executor.submit(process_ncen_tsv_file, tsv_name, row, zip_file, verbose) 
+                                           for tsv_name in tsv_files]
+                                for future in as_completed(futures):
+                                    tsv_data = future.result()
+                                    fund_summary.update(tsv_data)
 
-                            elif dataset_name == 'VALUATION_METHOD_CHANGE_SERIES':
-                                for index, row in chunk.iterrows():
-                                    valuation_series_data = {
-                                        'ACCESSION_NUMBER': row['ACCESSION_NUMBER'],
-                                        'VALUATION_METHOD_CHANGE_SEQNUM': row['VALUATION_METHOD_CHANGE_SEQNUM'],
-                                        'SERIES_NAME': row['SERIES_NAME'],
-                                        'SERIES_ID': row['SERIES_ID']
-                                    }
-                                    all_data[dataset_name].append(valuation_series_data)
-                                    pbar.update(1)
+                                # Add quarterly data
+                                if 'FUND_INFO_REPORT_DATE' in fund_summary:
+                                    report_date = pd.to_datetime(fund_summary['FUND_INFO_REPORT_DATE'], errors='coerce')
+                                    if not pd.isna(report_date):
+                                        fund_summary['YYYYQQ'] = f"{report_date.year}Q{((report_date.month-1)//3) + 1}"
+                                    else:
+                                        fund_summary['YYYYQQ'] = None
+                                else:
+                                    fund_summary['YYYYQQ'] = None
 
-                            elif dataset_name == 'FUND_REPORTED_INFO':
-                                for index, row in chunk.iterrows():
-                                    fund_info_data = {
-                                        'FUND_ID': row['FUND_ID'],
-                                        'ACCESSION_NUMBER': row['ACCESSION_NUMBER'],
-                                        'FUND_NAME': row['FUND_NAME'],
-                                        'SERIES_ID': row['SERIES_ID'],
-                                        'LEI': row['LEI'],
-                                        'IS_FIRST_FILING': row['IS_FIRST_FILING'],
-                                        'AUTHORIZED_SHARES_CNT': row['AUTHORIZED_SHARES_CNT'],
-                                        'ADDED_NEW_SHARES_CNT': row['ADDED_NEW_SHARES_CNT'],
-                                        'TERMINATED_SHARES_CNT': row['TERMINATED_SHARES_CNT'],
-                                        'IS_ETF': row['IS_ETF'],
-                                        'IS_ETMF': row['IS_ETMF'],
-                                        'IS_INDEX': row['IS_INDEX'],
-                                        'IS_MULTI_INVERSE_INDEX': row['IS_MULTI_INVERSE_INDEX'],
-                                        'IS_INTERVAL': row['IS_INTERVAL'],
-                                        'IS_FUND_OF_FUND': row['IS_FUND_OF_FUND'],
-                                        'IS_MASTER_FEEDER': row['IS_MASTER_FEEDER'],
-                                        'IS_MONEY_MARKET': row['IS_MONEY_MARKET'],
-                                        'IS_TARGET_DATE': row['IS_TARGET_DATE'],
-                                        'IS_UNDERLYING_FUND': row['IS_UNDERLYING_FUND'],
-                                        'IS_FUND_TYPE_NA': row['IS_FUND_TYPE_NA'],
-                                        'IS_INDEX_AFFILIATED': row['IS_INDEX_AFFILIATED'],
-                                        'IS_INDEX_EXCLUSIVE': row['IS_INDEX_EXCLUSIVE'],
-                                        'RETURN_B4_FEES_AND_EXPENSES': row['RETURN_B4_FEES_AND_EXPENSES'],
-                                        'RETURN_AFTR_FEES_AND_EXPENSES': row['RETURN_AFTR_FEES_AND_EXPENSES'],
-                                        'STDV_B4_FEES_AND_EXPENSES': row['STDV_B4_FEES_AND_EXPENSES'],
-                                        'STDV_AFTR_FEES_AND_EXPENSES': row['STDV_AFTR_FEES_AND_EXPENSES'],
-                                        'IS_NON_DIVERSIFIED': row['IS_NON_DIVERSIFIED'],
-                                        'IS_FOREIGN_SUBSIDIARY': row['IS_FOREIGN_SUBSIDIARY'],
-                                        'IS_SEC_LENDING_AUTHORIZED': row['IS_SEC_LENDING_AUTHORIZED'],
-                                        'DID_LEND_SECURITIES': row['DID_LEND_SECURITIES'],
-                                        'IS_COLLATERAL_LIQUIDATED': row['IS_COLLATERAL_LIQUIDATED'],
-                                        'IS_IMPACTED_ADVERSELY': row['IS_IMPACTED_ADVERSELY'],
-                                        'IS_PYMNT_REV_SHARING_SPLIT': row['IS_PYMNT_REV_SHARING_SPLIT'],
-                                        'IS_PYMNT_NON_REV_SHARING_SPLIT': row['IS_PYMNT_NON_REV_SHARING_SPLIT'],
-                                        'IS_PYMNT_ADMIN_FEE': row['IS_PYMNT_ADMIN_FEE'],
-                                        'IS_PYMNT_CASH_COLLATERAL_FEE': row['IS_PYMNT_CASH_COLLATERAL_FEE'],
-                                        'IS_PYMNT_INDEMNI_FEE': row['IS_PYMNT_INDEMNI_FEE'],
-                                        'IS_PYMNT_OTHER': row['IS_PYMNT_OTHER'],
-                                        'IS_PYMNT_NA': row['IS_PYMNT_NA'],
-                                        'OTHER_FEE_DESC': row['OTHER_FEE_DESC'],
-                                        'AVG_VALUE_SEC_LOAN': row['AVG_VALUE_SEC_LOAN'],
-                                        'NET_INCOME_SEC_LENDING': row['NET_INCOME_SEC_LENDING'],
-                                        'IS_RELYON_RULE_10F_3': row['IS_RELYON_RULE_10F_3'],
-                                        'IS_RELYON_RULE_12D1_1': row['IS_RELYON_RULE_12D1_1'],
-                                        'IS_RELYON_RULE_15A_4': row['IS_RELYON_RULE_15A_4'],
-                                        'IS_RELYON_RULE_17A_6': row['IS_RELYON_RULE_17A_6'],
-                                        'IS_RELYON_RULE_17A_7': row['IS_RELYON_RULE_17A_7'],
-                                        'IS_RELYON_RULE_17A_8': row['IS_RELYON_RULE_17A_8'],
-                                        'IS_RELYON_RULE_17E_1': row['IS_RELYON_RULE_17E_1'],
-                                        'IS_RELYON_RULE_22D_1': row['IS_RELYON_RULE_22D_1'],
-                                        'IS_RELYON_RULE_23C_1': row['IS_RELYON_RULE_23C_1'],
-                                        'IS_RELYON_RULE_32A_4': row['IS_RELYON_RULE_32A_4'],
-                                        'IS_RELYON_RULE_6C_11': row['IS_RELYON_RULE_6C_11'],
-                                        'IS_RELYON_RULE_12D1_4': row['IS_RELYON_RULE_12D1_4'],
-                                        'IS_RELYON_RULE_12D1G': row['IS_RELYON_RULE_12D1G'],
-                                        'IS_RELYON_RULE_18F_4': row['IS_RELYON_RULE_18F_4'],
-                                        'IS_RELYON_RULE_18F_4C4': row['IS_RELYON_RULE_18F_4C4'],
-                                        'IS_RELYON_RULE_18F_4C2': row['IS_RELYON_RULE_18F_4C2'],
-                                        'IS_RELYON_RULE_18F_4DI': row['IS_RELYON_RULE_18F_4DI'],
-                                        'IS_RELYON_RULE_18F_4DII': row['IS_RELYON_RULE_18F_4DII'],
-                                        'IS_RELYON_RULE_18F_4E': row['IS_RELYON_RULE_18F_4E'],
-                                        'IS_RELYON_RULE_18F_4F': row['IS_RELYON_RULE_18F_4F'],
-                                        'IS_RELYON_RULE_NA': row['IS_RELYON_RULE_NA'],
-                                        'HAS_EXP_LIMIT': row['HAS_EXP_LIMIT'],
-                                        'HAS_EXP_REDUCED_WAIVED': row['HAS_EXP_REDUCED_WAIVED'],
-                                        'HAS_EXP_SUBJ_RECOUP': row['HAS_EXP_SUBJ_RECOUP'],
-                                        'HAS_EXP_RECOUPED': row['HAS_EXP_RECOUPED'],
-                                        'HAS_XAGENT_HIRED_FIRED_MI': row['HAS_XAGENT_HIRED_FIRED_MI'],
-                                        'HAS_PRICING_SRVC_HIRED_FIRED': row['HAS_PRICING_SRVC_HIRED_FIRED'],
-                                        'HAS_CUSTODIAN_HIRED_FIRED_MI': row['HAS_CUSTODIAN_HIRED_FIRED_MI'],
-                                        'HAS_SH_SRVC_HIRED_FIRED': row['HAS_SH_SRVC_HIRED_FIRED'],
-                                        'HAS_ADMIN_HIRED_FIRED': row['HAS_ADMIN_HIRED_FIRED'],
-                                        'AGG_COMMISSION': row['AGG_COMMISSION'],
-                                        'AGG_PRINCIPAL': row['AGG_PRINCIPAL'],
-                                        'DID_PAY_BROKER_RESEARCH': row['DID_PAY_BROKER_RESEARCH'],
-                                        'MONTHLY_AVG_NET_ASSETS': row['MONTHLY_AVG_NET_ASSETS'],
-                                        'DAILY_AVG_NET_ASSETS': row['DAILY_AVG_NET_ASSETS'],
-                                        'HAS_LINE_OF_CREDIT': row['HAS_LINE_OF_CREDIT'],
-                                        'HAS_INTERFUND_LENDING': row['HAS_INTERFUND_LENDING'],
-                                        'HAS_INTERFUND_BORROWING': row['HAS_INTERFUND_BORROWING'],
-                                        'HAS_SWING_PRICING': row['HAS_SWING_PRICING'],
-                                        'SWING_FACTOR_UPPER_LIMIT': row['SWING_FACTOR_UPPER_LIMIT'],
-                                        'DID_MAKE_RIGHTS_OFFERING': row['DID_MAKE_RIGHTS_OFFERING'],
-                                        'DID_MAKE_SECOND_OFFERING': row['DID_MAKE_SECOND_OFFERING'],
-                                        'IS_SECONDARY_COMMON': row['IS_SECONDARY_COMMON'],
-                                        'IS_SECONDARY_PREFERRED': row['IS_SECONDARY_PREFERRED'],
-                                        'IS_SECONDARY_WARRANTS': row['IS_SECONDARY_WARRANTS'],
-                                        'IS_SECONDARY_CONVERTIBLES': row['IS_SECONDARY_CONVERTIBLES'],
-                                        'IS_SECONDARY_BONDS': row['IS_SECONDARY_BONDS'],
-                                        'IS_SECONDARY_OTHER': row['IS_SECONDARY_OTHER'],
-                                        'OTHER_SECONDARY_DESC': row['OTHER_SECONDARY_DESC'],
-                                        'DID_REPURCHASE_SECURITY': row['DID_REPURCHASE_SECURITY'],
-                                        'IS_REPUR_COMMON': row['IS_REPUR_COMMON'],
-                                        'IS_REPUR_PREFERRED': row['IS_REPUR_PREFERRED'],
-                                        'IS_REPUR_WARRANTS': row['IS_REPUR_WARRANTS'],
-                                        'IS_REPUR_CONVERTIBLES': row['IS_REPUR_CONVERTIBLES'],
-                                        'IS_REPUR_BONDS': row['IS_REPUR_BONDS'],
-                                        'IS_REPUR_OTHER': row['IS_REPUR_OTHER'],
-                                        'OTHER_REPUR_DESC': row['OTHER_REPUR_DESC'],
-                                        'IS_LONG_TERM_DEBT_DEFAULT': row['IS_LONG_TERM_DEBT_DEFAULT'],
-                                        'IS_ACCUM_DIVIDEND_IN_ARREARS': row['IS_ACCUM_DIVIDEND_IN_ARREARS'],
-                                        'IS_SECURITY_MAT_MODIFIED': row['IS_SECURITY_MAT_MODIFIED'],
-                                        'MANAGEMENT_FEE': row['MANAGEMENT_FEE'],
-                                        'NET_OPERATING_EXPENSES': row['NET_OPERATING_EXPENSES'],
-                                        'MARKET_PRICE_PER_SHARE': row['MARKET_PRICE_PER_SHARE'],
-                                        'NAV_PER_SHARE': row['NAV_PER_SHARE'],
-                                        'HAS_XAGENT_HIRED_FIRED_CE': row['HAS_XAGENT_HIRED_FIRED_CE'],
-                                        'HAS_CUSTODIAN_HIRED_FIRED_CE': row['HAS_CUSTODIAN_HIRED_FIRED_CE']
-                                    }
-                                    all_data[dataset_name].append(fund_info_data)
-                                    pbar.update(1)
+                                summary.append(fund_summary)
+                                if verbose and index % 10 == 0:
+                                    log_safe(f"Processed {index} funds for {zip_file}")
 
-                            elif dataset_name == 'SHARES_OUTSTANDING':
-                                for index, row in chunk.iterrows():
-                                    shares_data = {
-                                        'FUND_ID': row['FUND_ID'],
-                                        'CLASS_NAME': row['CLASS_NAME'],
-                                        'CLASS_ID': row['CLASS_ID'],
-                                        'TICKER': row['TICKER']
-                                    }
-                                    all_data[dataset_name].append(shares_data)
-                                    pbar.update(1)
+                    pbar.update(chunksize)
 
-                            elif dataset_name == 'FEEDER_FUNDS':
-                                for index, row in chunk.iterrows():
-                                    feeder_fund_data = {
-                                        'FUND_ID': row['FUND_ID'],
-                                        'FUND_NAME': row['FUND_NAME'],
-                                        'REGISTERED_FILE_NUM': row['REGISTERED_FILE_NUM'],
-                                        'REGISTERED_SERIES_ID': row['REGISTERED_SERIES_ID'],
-                                        'REGISTERED_FUND_LEI': row['REGISTERED_FUND_LEI'],
-                                        'UNREGISTERED_FILE_NUM': row['UNREGISTERED_FILE_NUM'],
-                                        'UNREGISTERED_FUND_LEI': row['UNREGISTERED_FUND_LEI']
-                                    }
-                                    all_data[dataset_name].append(feeder_fund_data)
-                                    pbar.update(1)
-
-                            elif dataset_name == 'MASTER_FUNDS':
-                                for index, row in chunk.iterrows():
-                                    master_fund_data = {
-                                        'FUND_ID': row['FUND_ID'],
-                                        'FUND_NAME': row['FUND_NAME'],
-                                        'FILE_NUM': row['FILE_NUM'],
-                                        'SEC_FILE_NUM': row['SEC_FILE_NUM'],
-                                        'FUND_LEI': row['FUND_LEI']
-                                    }
-                                    all_data[dataset_name].append(master_fund_data)
-                                    pbar.update(1)
-
-                            elif dataset_name == 'FOREIGN_INVESTMENT':
-                                for index, row in chunk.iterrows():
-                                    foreign_investment_data = {
-                                        'FUND_ID': row['FUND_ID'],
-                                        'FOREIGN_SUBSIDIARY_NAME': row['FOREIGN_SUBSIDIARY_NAME'],
-                                        'FOREIGN_SUBSIDIARY_LEI': row['FOREIGN_SUBSIDIARY_LEI']
-                                    }
-                                    all_data[dataset_name].append(foreign_investment_data)
-                                    pbar.update(1)
-
-                            elif dataset_name == 'SECURITY_LENDING':
-                                for index, row in chunk.iterrows():
-                                    security_lending_data = {
-                                        'FUND_ID': row['FUND_ID'],
-                                        'SECURITY_LENDING_SEQNUM': row['SECURITY_LENDING_SEQNUM'],
-                                        'SECURITIES_AGENT_NAME': row['SECURITIES_AGENT_NAME'],
-                                        'SECURITIES_AGENT_LEI': row['SECURITIES_AGENT_LEI'],
-                                        'IS_AFFILIATED': row['IS_AFFILIATED'],
-                                        'SECURITY_AGENT_IDEMNITY': row['SECURITY_AGENT_IDEMNITY'],
-                                        'DID_INDEMNIFICATION_RIGHTS': row['DID_INDEMNIFICATION_RIGHTS']
-                                    }
-                                    all_data[dataset_name].append(security_lending_data)
-                                    pbar.update(1)
-
-                            elif dataset_name == 'SEC_LENDING_INDEMNITY_PROVIDER':
-                                for index, row in chunk.iterrows():
-                                    indemnity_provider_data = {
-                                        'FUND_ID': row['FUND_ID'],
-                                        'SECURITY_LENDING_SEQNUM': row['SECURITY_LENDING_SEQNUM'],
-                                        'INDEMNITY_PROVIDER_NAME': row['INDEMNITY_PROVIDER_NAME'],
-                                        'INDEMNITY_PROVIDER_LEI': row['INDEMNITY_PROVIDER_LEI']
-                                    }
-                                    all_data[dataset_name].append(indemnity_provider_data)
-                                    pbar.update(1)
-
-                            elif dataset_name == 'COLLATERAL_MANAGER':
-                                for index, row in chunk.iterrows():
-                                    collateral_manager_data = {
-                                        'FUND_ID': row['FUND_ID'],
-                                        'COLLATERAL_MANAGER_NAME': row['COLLATERAL_MANAGER_NAME'],
-                                        'COLLATERAL_MANAGER_LEI': row['COLLATERAL_MANAGER_LEI'],
-                                        'IS_AFFILIATED': row['IS_AFFILIATED'],
-                                        'IS_AFFILIATED_WITH_FUND': row['IS_AFFILIATED_WITH_FUND']
-                                    }
-                                    all_data[dataset_name].append(collateral_manager_data)
-                                    pbar.update(1)
-
-                            elif dataset_name == 'ADVISER':
-                                for index, row in chunk.iterrows():
-                                    adviser_data = {
-                                        'FUND_ID': row['FUND_ID'],
-                                        'SOURCE': row['SOURCE'],
-                                        'ADVISER_TYPE': row['ADVISER_TYPE'],
-                                        'ADVISER_NAME': row['ADVISER_NAME'],
-                                        'FILE_NUM': row['FILE_NUM'],
-                                        'CRD_NUM': row['CRD_NUM'],
-                                        'ADVISER_LEI': row['ADVISER_LEI'],
-                                        'STATE': row['STATE'],
-                                        'COUNTRY': row['COUNTRY'],
-                                        'IS_AFFILIATED': row['IS_AFFILIATED'],
-                                        'IS_ADVISOR_HIRED': row['IS_ADVISOR_HIRED'],
-                                        'ADVISOR_START_DATE': row['ADVISOR_START_DATE'],
-                                        'ADVISOR_TERMINATED_DATE': row['ADVISOR_TERMINATED_DATE']
-                                    }
-                                    all_data[dataset_name].append(adviser_data)
-                                    pbar.update(1)
-
-                            elif dataset_name == 'TRANSFER_AGENT':
-                                for index, row in chunk.iterrows():
-                                    transfer_agent_data = {
-                                        'FUND_ID': row['FUND_ID'],
-                                        'SOURCE': row['SOURCE'],
-                                        'TRANSFERAGENT_NAME': row['TRANSFERAGENT_NAME'],
-                                        'FILE_NUM': row['FILE_NUM'],
-                                        'TRANSFERAGENT_LEI': row['TRANSFERAGENT_LEI'],
-                                        'STATE': row['STATE'],
-                                        'COUNTRY': row['COUNTRY'],
-                                        'IS_AFFILIATED': row['IS_AFFILIATED'],
-                                        'IS_SUBTRANSFER_AGENT': row['IS_SUBTRANSFER_AGENT']
-                                    }
-                                    all_data[dataset_name].append(transfer_agent_data)
-                                    pbar.update(1)
-
-                            elif dataset_name == 'PRICING_SERVICE':
-                                for index, row in chunk.iterrows():
-                                    pricing_service_data = {
-                                        'FUND_ID': row['FUND_ID'],
-                                        'PRICING_SERVICE_NAME': row['PRICING_SERVICE_NAME'],
-                                        'PRICING_SERVICE_LEI': row['PRICING_SERVICE_LEI'],
-                                        'OTHER_IDENTIFYING_NUM_DESC': row['OTHER_IDENTIFYING_NUM_DESC'],
-                                        'STATE': row['STATE'],
-                                        'COUNTRY': row['COUNTRY'],
-                                        'IS_AFFILIATED': row['IS_AFFILIATED']
-                                    }
-                                    all_data[dataset_name].append(pricing_service_data)
-                                    pbar.update(1)
-
-                            elif dataset_name == 'CUSTODIAN':
-                                for index, row in chunk.iterrows():
-                                    custodian_data = {
-                                        'FUND_ID': row['FUND_ID'],
-                                        'SOURCE': row['SOURCE'],
-                                        'CUSTODIAN_NAME': row['CUSTODIAN_NAME'],
-                                        'CUSTODIAN_LEI': row['CUSTODIAN_LEI'],
-                                        'STATE': row['STATE'],
-                                        'COUNTRY': row['COUNTRY'],
-                                        'IS_AFFILIATED': row['IS_AFFILIATED'],
-                                        'IS_SUB_CUSTODIAN': row['IS_SUB_CUSTODIAN'],
-                                        'CUSTODY_TYPE': row['CUSTODY_TYPE'],
-                                        'OTHER_CUSTODIAN_DESC': row['OTHER_CUSTODIAN_DESC']
-                                    }
-                                    all_data[dataset_name].append(custodian_data)
-                                    pbar.update(1)
-
-                            elif dataset_name == 'SHAREHOLDER_SERVICING_AGENT':
-                                for index, row in chunk.iterrows():
-                                    servicing_agent_data = {
-                                        'FUND_ID': row['FUND_ID'],
-                                        'AGENT_NAME': row['AGENT_NAME'],
-                                        'AGENT_LEI': row['AGENT_LEI'],
-                                        'OTHER_IDENTIFYING_NUM_DESC': row['OTHER_IDENTIFYING_NUM_DESC'],
-                                        'STATE': row['STATE'],
-                                        'COUNTRY': row['COUNTRY'],
-                                        'IS_AFFILIATED': row['IS_AFFILIATED'],
-                                        'IS_SUBSHARE': row['IS_SUBSHARE']
-                                    }
-                                    all_data[dataset_name].append(servicing_agent_data)
-                                    pbar.update(1)
-
-                            elif dataset_name == 'ADMIN':
-                                for index, row in chunk.iterrows():
-                                    admin_data = {
-                                        'FUND_ID': row['FUND_ID'],
-                                        'ADMIN_NAME': row['ADMIN_NAME'],
-                                        'ADMIN_LEI': row['ADMIN_LEI'],
-                                        'OTHER_IDENTIFYING_NUM': row['OTHER_IDENTIFYING_NUM'],
-                                        'STATE': row['STATE'],
-                                        'COUNTRY': row['COUNTRY'],
-                                        'IS_AFFILIATED': row['IS_AFFILIATED'],
-                                        'IS_SUB_ADMIN': row['IS_SUB_ADMIN']
-                                    }
-                                    all_data[dataset_name].append(admin_data)
-                                    pbar.update(1)
-
-                            elif dataset_name == 'BROKER_DEALER':
-                                for index, row in chunk.iterrows():
-                                    broker_dealer_data = {
-                                        'FUND_ID': row['FUND_ID'],
-                                        'BROKER_DEALER_NAME': row['BROKER_DEALER_NAME'],
-                                        'FILE_NUM': row['FILE_NUM'],
-                                        'CRD_NUM': row['CRD_NUM'],
-                                        'BROKER_DEALER_LEI': row['BROKER_DEALER_LEI'],
-                                        'STATE': row['STATE'],
-                                        'COUNTRY': row['COUNTRY'],
-                                        'COMMISSION': row['COMMISSION']
-                                    }
-                                    all_data[dataset_name].append(broker_dealer_data)
-                                    pbar.update(1)
-
-                            elif dataset_name == 'BROKER':
-                                for index, row in chunk.iterrows():
-                                    broker_data = {
-                                        'FUND_ID': row['FUND_ID'],
-                                        'BROKER_NAME': row['BROKER_NAME'],
-                                        'FILE_NUM': row['FILE_NUM'],
-                                        'CRD_NUM': row['CRD_NUM'],
-                                        'BROKER_LEI': row['BROKER_LEI'],
-                                        'STATE': row['STATE'],
-                                        'COUNTRY': row['COUNTRY'],
-                                        'GROSS_COMMISSION': row['GROSS_COMMISSION']
-                                    }
-                                    all_data[dataset_name].append(broker_data)
-                                    pbar.update(1)
-
-                            elif dataset_name == 'PRINCIPAL_TRANSACTION':
-                                for index, row in chunk.iterrows():
-                                    principal_transaction_data = {
-                                        'FUND_ID': row['FUND_ID'],
-                                        'PRINCIPAL_NAME': row['PRINCIPAL_NAME'],
-                                        'FILE_NUM': row['FILE_NUM'],
-                                        'CRD_NUM': row['CRD_NUM'],
-                                        'PRINCIPAL_LEI': row['PRINCIPAL_LEI'],
-                                        'STATE': row['STATE'],
-                                        'COUNTRY': row['COUNTRY'],
-                                        'PRINCIPAL_TOTAL_PURCHASE_SALE': row['PRINCIPAL_TOTAL_PURCHASE_SALE']
-                                    }
-                                    all_data[dataset_name].append(principal_transaction_data)
-                                    pbar.update(1)
-
-                            elif dataset_name == 'LINE_OF_CREDIT_DETAIL':
-                                for index, row in chunk.iterrows():
-                                    credit_detail_data = {
-                                        'FUND_ID': row['FUND_ID'],
-                                        'LINE_OF_CREDIT_SEQNUM': row['LINE_OF_CREDIT_SEQNUM'],
-                                        'IS_CREDIT_LINE_COMMITTED': row['IS_CREDIT_LINE_COMMITTED'],
-                                        'LINE_OF_CREDIT_SIZE': row['LINE_OF_CREDIT_SIZE'],
-                                        'CREDIT_TYPE': row['CREDIT_TYPE'],
-                                        'IS_CREDIT_LINE_USED': row['IS_CREDIT_LINE_USED'],
-                                        'AVERAGE_CREDIT_LINE_USED': row['AVERAGE_CREDIT_LINE_USED'],
-                                        'DAYS_CREDIT_USED': row['DAYS_CREDIT_USED']
-                                    }
-                                    all_data[dataset_name].append(credit_detail_data)
-                                    pbar.update(1)
-
-                            elif dataset_name == 'LINE_OF_CREDIT_INSTITUTION':
-                                for index, row in chunk.iterrows():
-                                    credit_institution_data = {
-                                        'FUND_ID': row['FUND_ID'],
-                                        'LINE_OF_CREDIT_SEQNUM': row['LINE_OF_CREDIT_SEQNUM'],
-                                        'CREDIT_INSTITUTION_NAME': row['CREDIT_INSTITUTION_NAME']
-                                    }
-                                    all_data[dataset_name].append(credit_institution_data)
-                                    pbar.update(1)
-
-                            elif dataset_name == 'CREDIT_USER':
-                                for index, row in chunk.iterrows():
-                                    credit_user_data = {
-                                        'FUND_ID': row['FUND_ID'],
-                                        'LINE_OF_CREDIT_SEQNUM': row['LINE_OF_CREDIT_SEQNUM'],
-                                        'FUND_NAME': row['FUND_NAME'],
-                                        'SEC_FILE_NUM': row['SEC_FILE_NUM']
-                                    }
-                                    all_data[dataset_name].append(credit_user_data)
-                                    pbar.update(1)
-
-                            elif dataset_name == 'INTER_FUND_LENDING_DETAIL':
-                                for index, row in chunk.iterrows():
-                                    lending_detail_data = {
-                                        'FUND_ID': row['FUND_ID'],
-                                        'LENDING_LOAN_AVERAGE': row['LENDING_LOAN_AVERAGE'],
-                                        'LENDING_DAYS_OUTSTANDING': row['LENDING_DAYS_OUTSTANDING']
-                                    }
-                                    all_data[dataset_name].append(lending_detail_data)
-                                    pbar.update(1)
-
-                            elif dataset_name == 'INTER_FUND_BORROWING_DETAIL':
-                                for index, row in chunk.iterrows():
-                                    borrowing_detail_data = {
-                                        'FUND_ID': row['FUND_ID'],
-                                        'BORROWING_LOAN_AVERAGE': row['BORROWING_LOAN_AVERAGE'],
-                                        'BORROWING_DAYS_OUTSTANDING': row['BORROWING_DAYS_OUTSTANDING']
-                                    }
-                                    all_data[dataset_name].append(borrowing_detail_data)
-                                    pbar.update(1)
-
-                            elif dataset_name == 'SECURITY_RELATED_ITEM':
-                                for index, row in chunk.iterrows():
-                                    security_item_data = {
-                                        'FUND_ID': row['FUND_ID'],
-                                        'SECURITY_RELATED_ITEM_SEQNUM': row['SECURITY_RELATED_ITEM_SEQNUM'],
-                                        'DESCRIPTION': row['DESCRIPTION'],
-                                        'SECURITY_CLASS_TITLE': row['SECURITY_CLASS_TITLE'],
-                                        'OTHER_SECURITY_DESCRIPTION': row['OTHER_SECURITY_DESCRIPTION'],
-                                        'EXCHANGE': row['EXCHANGE'],
-                                        'TICKER_SYMBOL': row['TICKER_SYMBOL']
-                                    }
-                                    all_data[dataset_name].append(security_item_data)
-                                    pbar.update(1)
-
-                            elif dataset_name == 'RIGHTS_OFFERING_FUND':
-                                for index, row in chunk.iterrows():
-                                    rights_offering_data = {
-                                        'FUND_ID': row['FUND_ID'],
-                                        'IS_RIGHTS_OFFER_COMMON': row['IS_RIGHTS_OFFER_COMMON'],
-                                        'IS_RIGHTS_OFFER_PREFERRED': row['IS_RIGHTS_OFFER_PREFERRED'],
-                                        'IS_RIGHTS_OFFER_WARRANTS': row['IS_RIGHTS_OFFER_WARRANTS'],
-                                        'IS_RIGHTS_OFFER_CONVERTIBLES': row['IS_RIGHTS_OFFER_CONVERTIBLES'],
-                                        'IS_RIGHTS_OFFER_BONDS': row['IS_RIGHTS_OFFER_BONDS'],
-                                        'IS_RIGHTS_OFFER_OTHER': row['IS_RIGHTS_OFFER_OTHER'],
-                                        'RIGHTS_OFFER_DESC': row['RIGHTS_OFFER_DESC'],
-                                        'PCT_PARTCI_PRIMARY_OFFERING': row['PCT_PARTCI_PRIMARY_OFFERING']
-                                    }
-                                    all_data[dataset_name].append(rights_offering_data)
-                                    pbar.update(1)
-
-                            elif dataset_name == 'LONGTERM_DEBT_DEFAULT':
-                                for index, row in chunk.iterrows():
-                                    debt_default_data = {
-                                        'FUND_ID': row['FUND_ID'],
-                                        'DEFAULT_NATURE': row['DEFAULT_NATURE'],
-                                        'DEFAULT_DATE': row['DEFAULT_DATE'],
-                                        'DEFAULT_AMNT_PER_1000': row['DEFAULT_AMNT_PER_1000'],
-                                        'TOTAL_DEFAULT_AMNT': row['TOTAL_DEFAULT_AMNT']
-                                    }
-                                    all_data[dataset_name].append(debt_default_data)
-                                    pbar.update(1)
-
-                            elif dataset_name == 'DIVIDENDS_IN_ARREAR':
-                                for index, row in chunk.iterrows():
-                                    dividends_arrear_data = {
-                                        'FUND_ID': row['FUND_ID'],
-                                        'ISSUE_TITLE': row['ISSUE_TITLE'],
-                                        'AMOUNT_PER_SHARE_IN_ARREAR': row['AMOUNT_PER_SHARE_IN_ARREAR']
-                                    }
-                                    all_data[dataset_name].append(dividends_arrear_data)
-                                    pbar.update(1)
-
-                            elif dataset_name == 'SECURITY_EXCHANGE':
-                                for index, row in chunk.iterrows():
-                                    exchange_data = {
-                                        'FUND_ID': row['FUND_ID'],
-                                        'FUND_EXCHANGE': row['FUND_EXCHANGE'],
-                                        'FUND_TICKER_SYMBOL': row['FUND_TICKER_SYMBOL']
-                                    }
-                                    all_data[dataset_name].append(exchange_data)
-                                    pbar.update(1)
-
-                            elif dataset_name == 'AUTHORIZED_PARTICIPANT':
-                                for index, row in chunk.iterrows():
-                                    participant_data = {
-                                        'FUND_ID': row['FUND_ID'],
-                                        'PARTICIPANT_NAME': row['PARTICIPANT_NAME'],
-                                        'FILE_NUM': row['FILE_NUM'],
-                                        'CRD_NUM': row['CRD_NUM'],
-                                        'PARTICIPANT_LEI': row['PARTICIPANT_LEI'],
-                                        'PURCHASE_VALUE': row['PURCHASE_VALUE'],
-                                        'REDEEM_VALUE': row['REDEEM_VALUE']
-                                    }
-                                    all_data[dataset_name].append(participant_data)
-                                    pbar.update(1)
-
-                            elif dataset_name == 'ETF':
-                                for index, row in chunk.iterrows():
-                                    etf_data = {
-                                        'FUND_ID': row['FUND_ID'],
-                                        'FUND_NAME': row['FUND_NAME'],
-                                        'SERIES_ID': row['SERIES_ID'],
-                                        'IS_COLLATERAL_REQUIRED': row['IS_COLLATERAL_REQUIRED'],
-                                        'NUM_SHARES_PER_CREATION_UNIT': row['NUM_SHARES_PER_CREATION_UNIT'],
-                                        'PURCHASED_AVG_PCT_CASH': row['PURCHASED_AVG_PCT_CASH'],
-                                        'PURCHASED_STDV_PCT_CASH': row['PURCHASED_STDV_PCT_CASH'],
-                                        'PURCHASED_AVG_PCT_NON_CASH': row['PURCHASED_AVG_PCT_NON_CASH'],
-                                        'PURCHASED_STDV_PCT_NON_CASH': row['PURCHASED_STDV_PCT_NON_CASH'],
-                                        'REDEEMED_AVG_PCT_CASH': row['REDEEMED_AVG_PCT_CASH'],
-                                        'REDEEMED_STDV_PCT_CASH': row['REDEEMED_STDV_PCT_CASH'],
-                                        'REDEEMED_AVG_PCT_NON_CASH': row['REDEEMED_AVG_PCT_NON_CASH'],
-                                        'REDEEMED_STDV_PCT_NON_CASH': row['REDEEMED_STDV_PCT_NON_CASH'],
-                                        'PURCH_AVG_FEE_PER_UNIT': row['PURCH_AVG_FEE_PER_UNIT'],
-                                        'PURCH_AVG_FEE_SAME_DAY': row['PURCH_AVG_FEE_SAME_DAY'],
-                                        'PURCH_AVG_FEE_PERCENTAGE': row['PURCH_AVG_FEE_PERCENTAGE'],
-                                        'PURCH_AVG_FEE_CASH_PER_UNIT': row['PURCH_AVG_FEE_CASH_PER_UNIT'],
-                                        'PURCH_AVG_FEE_CASH_SAME_DAY': row['PURCH_AVG_FEE_CASH_SAME_DAY'],
-                                        'PURCH_AVG_FEE_CASH_PERCENTAGE': row['PURCH_AVG_FEE_CASH_PERCENTAGE'],
-                                        'REDEEM_AVG_FEE_PER_UNIT': row['REDEEM_AVG_FEE_PER_UNIT'],
-                                        'REDEEM_AVG_FEE_SAME_DAY': row['REDEEM_AVG_FEE_SAME_DAY'],
-                                        'REDEEM_AVG_FEE_PERCENTAGE': row['REDEEM_AVG_FEE_PERCENTAGE'],
-                                        'REDEEM_AVG_FEE_CASH_PER_UNIT': row['REDEEM_AVG_FEE_CASH_PER_UNIT'],
-                                        'REDEEM_AVG_FEE_CASH_SAME_DAY': row['REDEEM_AVG_FEE_CASH_SAME_DAY'],
-                                        'REDEEM_AVG_FEE_CASH_PERCENTAGE': row['REDEEM_AVG_FEE_CASH_PERCENTAGE'],
-                                        'IS_PERF_TRACKED_AFFILIA_PERSON': row['IS_PERF_TRACKED_AFFILIA_PERSON'],
-                                        'IS_PERF_TRACKED_EXCLUSIVELY': row['IS_PERF_TRACKED_EXCLUSIVELY'],
-                                        'ANNUAL_DIFF_B4_FEE_EXPENSE': row['ANNUAL_DIFF_B4_FEE_EXPENSE'],
-                                        'ANNUAL_DIFF_AFTER_FEE_EXPENSE': row['ANNUAL_DIFF_AFTER_FEE_EXPENSE'],
-                                        'ANNUAL_STDV_B4_FEE_EXPENSE': row['ANNUAL_STDV_B4_FEE_EXPENSE'],
-                                        'ANNUAL_STDV_AFTER_FEE_EXPENSE': row['ANNUAL_STDV_AFTER_FEE_EXPENSE'],
-                                        'IS_FUND_IN_KIND_ETF': row['IS_FUND_IN_KIND_ETF']
-                                    }
-                                    all_data[dataset_name].append(etf_data)
-                                    pbar.update(1)
-
-                            elif dataset_name == 'DEPOSITOR':
-                                for index, row in chunk.iterrows():
-                                    depositor_data = {
-                                        'ACCESSION_NUMBER': row['ACCESSION_NUMBER'],
-                                        'DEPOSITOR_NAME': row['DEPOSITOR_NAME'],
-                                        'CRD_NUM': row['CRD_NUM'],
-                                        'DEPOSITOR_LEI': row['DEPOSITOR_LEI'],
-                                        'STATE': row['STATE'],
-                                        'COUNTRY': row['COUNTRY'],
-                                        'ULTIMATE_PARENT_NAME': row['ULTIMATE_PARENT_NAME']
-                                    }
-                                    all_data[dataset_name].append(depositor_data)
-                                    pbar.update(1)
-
-                            elif dataset_name == 'UIT_ADMIN':
-                                for index, row in chunk.iterrows():
-                                    uit_admin_data = {
-                                        'ACCESSION_NUMBER': row['ACCESSION_NUMBER'],
-                                        'UIT_ADMIN_NAME': row['UIT_ADMIN_NAME'],
-                                        'UIT_ADMIN_LEI': row['UIT_ADMIN_LEI'],
-                                        'OTHER_IDENTIFYING_NUM': row['OTHER_IDENTIFYING_NUM'],
-                                        'STATE': row['STATE'],
-                                        'COUNTRY': row['COUNTRY'],
-                                        'IS_AFFILIATED': row['IS_AFFILIATED'],
-                                        'IS_SUB_ADMIN': row['IS_SUB_ADMIN']
-                                    }
-                                    all_data[dataset_name].append(uit_admin_data)
-                                    pbar.update(1)
-
-                            elif dataset_name == 'UIT':
-                                for index, row in chunk.iterrows():
-                                    uit_data = {
-                                        'ACCESSION_NUMBER': row['ACCESSION_NUMBER'],
-                                        'IS_ADMIN_HIRED_FIRED': row['IS_ADMIN_HIRED_FIRED'],
-                                        'IS_SEPERATE_ACCT': row['IS_SEPERATE_ACCT'],
-                                        'EXISTING_SERIES_CNT': row['EXISTING_SERIES_CNT'],
-                                        'NEW_SERIES_CNT': row['NEW_SERIES_CNT'],
-                                        'NEW_SERIES_AGG_VALUE': row['NEW_SERIES_AGG_VALUE'],
-                                        'SERIES_CURRENT_PROSPECTUS': row['SERIES_CURRENT_PROSPECTUS'],
-                                        'SERIES_CNT_ADDITIONAL_UNITS': row['SERIES_CNT_ADDITIONAL_UNITS'],
-                                        'TOTAL_VALUE_ADDITIONAL_UNIT': row['TOTAL_VALUE_ADDITIONAL_UNIT'],
-                                        'VALUE_UNIT_PLACED_SUBSEQUENT': row['VALUE_UNIT_PLACED_SUBSEQUENT'],
-                                        'TOTAL_ASSET_FOR_ALL_SERIES': row['TOTAL_ASSET_FOR_ALL_SERIES'],
-                                        'SERIES_ID': row['SERIES_ID'],
-                                        'NUM_CONTRACTS': row['NUM_CONTRACTS'],
-                                        'IS_RELYON_RULE_6C_7': row['IS_RELYON_RULE_6C_7'],
-                                        'IS_RELYON_RULE_11A_2': row['IS_RELYON_RULE_11A_2'],
-                                        'IS_RELYON_RULE_12D1_4': row['IS_RELYON_RULE_12D1_4'],
-                                        'IS_RELYON_RULE_12D1G': row['IS_RELYON_RULE_12D1G']
-                                    }
-                                    all_data[dataset_name].append(uit_data)
-                                    pbar.update(1)
-
-                            elif dataset_name == 'SERIES_CIK':
-                                for index, row in chunk.iterrows():
-                                    series_cik_data = {
-                                        'ACCESSION_NUMBER': row['ACCESSION_NUMBER'],
-                                        'SERIES_CIK': row['SERIES_CIK']
-                                    }
-                                    all_data[dataset_name].append(series_cik_data)
-                                    pbar.update(1)
-
-                            elif dataset_name == 'SPONSOR':
-                                for index, row in chunk.iterrows():
-                                    sponsor_data = {
-                                        'ACCESSION_NUMBER': row['ACCESSION_NUMBER'],
-                                        'SPONSOR_NAME': row['SPONSOR_NAME'],
-                                        'CRD_NUM': row['CRD_NUM'],
-                                        'SPONSOR_LEI': row['SPONSOR_LEI'],
-                                        'STATE': row['STATE'],
-                                        'COUNTRY': row['COUNTRY']
-                                    }
-                                    all_data[dataset_name].append(sponsor_data)
-                                    pbar.update(1)
-
-                            elif dataset_name == 'TRUSTEE':
-                                for index, row in chunk.iterrows():
-                                    trustee_data = {
-                                        'ACCESSION_NUMBER': row['ACCESSION_NUMBER'],
-                                        'TRUSTEE_NAME': row['TRUSTEE_NAME'],
-                                        'STATE': row['STATE'],
-                                        'COUNTRY': row['COUNTRY']
-                                    }
-                                    all_data[dataset_name].append(trustee_data)
-                                    pbar.update(1)
-
-                            elif dataset_name == 'CONTRACT_SECURITY':
-                                for index, row in chunk.iterrows():
-                                    contract_security_data = {
-                                        'ACCESSION_NUMBER': row['ACCESSION_NUMBER'],
-                                        'SECURITY_NAME': row['SECURITY_NAME'],
-                                        'CONTRACT_ID': row['CONTRACT_ID'],
-                                        'TOTAL_ASSET': row['TOTAL_ASSET'],
-                                        'NUM_CONTRACT_SOLD': row['NUM_CONTRACT_SOLD'],
-                                        'GROSS_PREMIUM_RECEIVED': row['GROSS_PREMIUM_RECEIVED'],
-                                        'GROSS_PREMIUM_RECEIVED_SEC1035': row['GROSS_PREMIUM_RECEIVED_SEC1035'],
-                                        'NUM_CONTRACT_AFFECTED_PAID': row['NUM_CONTRACT_AFFECTED_PAID'],
-                                        'CONTRACT_VALUE_REDEEMED': row['CONTRACT_VALUE_REDEEMED'],
-                                        'CONTRAC_VALUE_REDEEMED_SEC1035': row['CONTRAC_VALUE_REDEEMED_SEC1035'],
-                                        'NUM_CONTRACT_AFFECTED_REDEEMED': row['NUM_CONTRACT_AFFECTED_REDEEMED']
-                                    }
-                                    all_data[dataset_name].append(contract_security_data)
-                                    pbar.update(1)
-
-                            elif dataset_name == 'DIVESTMENT':
-                                for index, row in chunk.iterrows():
-                                    divestment_data = {
-                                        'ACCESSION_NUMBER': row['ACCESSION_NUMBER'],
-                                        'ISSUER_NAME': row['ISSUER_NAME'],
-                                        'TICKER': row['TICKER'],
-                                        'CUSIP': row['CUSIP'],
-                                        'DIVESTED_NUM_SHARES': row['DIVESTED_NUM_SHARES'],
-                                        'DIVESTED_DATE': row['DIVESTED_DATE'],
-                                        'STATUTE_NAME': row['STATUTE_NAME']
-                                    }
-                                    all_data[dataset_name].append(divestment_data)
-                                    pbar.update(1)
-
-                            elif dataset_name == 'REGISTRANT_HELDS_SECURITY':
-                                for index, row in chunk.iterrows():
-                                    held_security_data = {
-                                        'ACCESSION_NUMBER': row['ACCESSION_NUMBER'],
-                                        'TICKER': row['TICKER'],
-                                        'CUSIP': row['CUSIP'],
-                                        'TOTAL_NUM_SHARES': row['TOTAL_NUM_SHARES']
-                                    }
-                                    all_data[dataset_name].append(held_security_data)
-                                    pbar.update(1)
-
-                    if verbose:
-                        print(f"Processed {total_rows} rows from {file_name}")
-                elif verbose:
-                    print(f"Warning: {file_name} not found in {zip_file}")
-
-            if debug:
-                for dataset_name in all_data.keys():
-                    if all_data[dataset_name]:
-                        sample = all_data[dataset_name][0]
-                        print(f"Sample data from {dataset_name}: {sample}")
+                    if debug:
+                        result = chunk.apply(contains_search_term, axis=1)
+                        log_safe(f"Type of result: {type(result)}")
+                        log_safe(f"Result dtype: {result.dtype}")
+                        log_safe(f"First few values of result:\n{result.head()}")
 
     except Exception as e:
-        if verbose:
-            print(f"Error processing {zip_file}: {str(e)}")
-
-    return dict(all_data)
-def search_ncen(search_keywords, verbose=False, search_ncen_swaps=False):
-    import tqdm, pandas as pd
-    from concurrent.futures import ProcessPoolExecutor, as_completed
-    from functools import partial
-    import re
-    import queue
+        log_safe(f"Error processing {zip_file}: {str(e)}")
+    
+    return summary
+def search_ncen(search_keywords, verbose=False):
     import os
+    import pandas as pd
+    import tqdm
+    from datetime import datetime
     import gc
-    from multiprocessing import cpu_count
+    import logging
 
     secncen_path = os.path.join(ROOT_DIR, "SecNcen")
     os.makedirs(secncen_path, exist_ok=True)
     
-    # Function to sort zip files from oldest to youngest
-    def sort_key(filename):
-        match = re.match(r'(\d{4})q(\d)_ncen\.zip', filename)
-        if match:
-            year, quarter = int(match.group(1)), int(match.group(2))
-            return year * 4 + quarter  # Convert to a sortable number
-        return 0  # If no match, put at beginning
-
-    zip_files = sorted([os.path.join(secncen_path, f) for f in os.listdir(secncen_path) if f.endswith('.zip')], key=lambda x: sort_key(os.path.basename(x)))
+    # Get and sort ZIP files by date
+    zip_files = [os.path.join(secncen_path, f) for f in os.listdir(secncen_path) if f.endswith('.zip')]
+    zip_files = [os.path.normpath(path) for path in zip_files]
     
+    def get_file_date(file):
+        base_name = os.path.basename(file)
+        year = base_name[:4]
+        quarter_char = base_name[4]
+        quarter = {'q': 1, '1': 1, 'w': 2, '2': 2, 'e': 3, '3': 3, 'r': 4, '4': 4}.get(quarter_char.lower(), None)
+        if quarter is not None:
+            return datetime(int(year), quarter*3 - 2, 1)
+        return datetime.min  # Fallback for invalid dates
+    
+    zip_files.sort(key=get_file_date)  # Sort files chronologically
     search_terms = [term.strip() for term in search_keywords.split(',')]
     
-    output_file = os.path.join(ROOT_DIR, f"{search_keywords.replace(',', '_')}_summary_results.csv")
+    output_file = os.path.join(ROOT_DIR, "SecNcen", f"{search_keywords.replace(',', '_')}_summary_results.csv")
+    log_file = os.path.join(ROOT_DIR, "SecNcen", f"{search_keywords.replace(',', '_')}_process.log")
 
-    # Queue to hold results
-    result_queue = queue.Queue()
-
-    headers = [
-        'FUND_ID', 'FUND_NAME', 'SERIES_ID', 'FILENAME_TIMESTAMP', 'IS_ETF', 'IS_INDEX', 
-        'IS_FUND_OF_FUND', 'IS_MASTER_FEEDER', 'IS_MONEY_MARKET', 'IS_TARGET_DATE', 
-        'IS_UNDERLYING_FUND', 'YYYYQQ', 'CIK', 'REGISTRANT_NAME', 'FILE_NUM', 'LEI', 
-        'ADDRESS1', 'ADDRESS2', 'CITY', 'STATE', 'COUNTRY', 'ZIP', 'PHONE', 
-        'ADVISER_FUND_ID', 'ADVISER_SOURCE', 'ADVISER_ADVISER_TYPE', 'ADVISER_ADVISER_NAME', 
-        'ADVISER_FILE_NUM', 'ADVISER_CRD_NUM', 'ADVISER_ADVISER_LEI', 'ADVISER_STATE', 
-        'ADVISER_COUNTRY', 'ADVISER_IS_AFFILIATED', 'ADVISER_IS_ADVISOR_HIRED', 
-        'ADVISOR_START_DATE', 'ADVISOR_TERMINATED_DATE'
+    # Core headers from FUND_REPORTED_INFO and derived
+    core_headers = [
+        'FUND_ID', 'FUND_NAME', 'SERIES_ID', 'FILENAME_TIMESTAMP', 'FILING_DATE', 'ACCESSION_NUMBER',
+        'IS_ETF', 'IS_ETMF', 'IS_INDEX', 'IS_FUND_OF_FUND', 'IS_MASTER_FEEDER', 'IS_MONEY_MARKET',
+        'IS_TARGET_DATE', 'IS_UNDERLYING_FUND', 'LEI', 'YYYYQQ'
     ]
 
-    # Write headers to output file
-    with open(output_file, 'w', newline='') as csvfile:
-        pd.DataFrame(columns=headers).to_csv(csvfile, index=False, header=True, mode='w')
+    # All fields from N-CEN README (https://www.sec.gov/files/ncen_readme.pdf), prefixed by TSV source
+    all_tsv_fields = {
+        'SUBMISSION': [
+            'ACCESSION_NUMBER', 'SUBMISSION_TYPE', 'CIK', 'FILING_DATE', 'REPORT_ENDING_PERIOD',
+            'IS_REPORT_PERIOD_LT_12MONTH', 'FILE_NUM', 'REGISTRANT_SIGNED_NAME', 'DATE_SIGNED',
+            'SIGNATURE', 'TITLE', 'IS_LEGAL_PROCEEDINGS', 'IS_PROVISION_FINANCIAL_SUPPORT',
+            'IS_IPA_REPORT_INTERNAL_CONTROL', 'IS_CHANGE_ACC_PRINCIPLES', 'IS_INFO_REQUIRED_EO',
+            'IS_OTHER_INFO_REQUIRED', 'IS_MATERIAL_AMENDMENTS', 'IS_INST_DEFINING_RIGHTS',
+            'IS_NEW_OR_AMENDED_INV_ADV_CONT', 'IS_INFO_ITEM405', 'IS_CODE_OF_ETHICS'
+        ],
+        'REGISTRANT': [
+            'ACCESSION_NUMBER', 'REGISTRANT_NAME', 'FILE_NUM', 'CIK', 'LEI', 'ADDRESS1', 'ADDRESS2',
+            'CITY', 'STATE', 'COUNTRY', 'ZIP', 'PHONE', 'IS_FIRST_FILING', 'IS_LAST_FILING',
+            'IS_FAMILY_INVESTMENT_COMPANY', 'FAMILY_INVESTMENT_COMPANY_NAME', 'INVESTMENT_COMPANY_TYPE',
+            'TOTAL_SERIES', 'IS_REGISTERED_UNDER_ACT_1933', 'HAS_SECURITY_HOLDER_VOTE',
+            'HAS_LEGAL_PROCEEDING', 'IS_PROCEEDING_TERMINATED', 'IS_FIDELITY_BOND_CLAIMED',
+            'FIDELITY_BOND_CLAIMED_AMOUNT', 'HAS_DIRECTOR_INSURANCE_POLICY', 'HAS_DIRECTOR_FILED_CLAIM',
+            'FINANCIAL_SUPPORT_2REGISTRANT', 'IS_EXEMPTIVE_ORDER', 'IS_UNDERWRITER_HIRED_OR_FIRED',
+            'IS_PUB_ACCOUNTANT_CHANGED', 'IS_MATERIAL_WEAKNESS_NOTED', 'IS_ACCT_OPINION_QUALIFIED',
+            'IS_VALUE_METHOD_CHANGED', 'IS_ACCT_PRINCIPLE_CHANGED', 'IS_NAV_ERROR_CORRECTED',
+            'ANY_DIVIDEND_PAYMENT'
+        ],
+        'REGISTRANT_WEBSITE': ['ACCESSION_NUMBER', 'WEBPAGE'],
+        'LOCATION_BOOKS_RECORD': [
+            'ACCESSION_NUMBER', 'OFFICE_NAME', 'ADDRESS1', 'ADDRESS2', 'CITY', 'STATE', 'COUNTRY',
+            'ZIP', 'PHONE', 'BOOKS_RECORDS_DESC'
+        ],
+        'TERMINATED_ORGANIZATION': ['ACCESSION_NUMBER', 'SERIES_NAME', 'SERIES_ID', 'TERMINATION_DATE'],
+        'DIRECTOR': ['ACCESSION_NUMBER', 'DIRECTOR_SEQNUM', 'DIRECTOR_NAME', 'CRD_NUMBER', 'IS_INTERESTED_PERSON'],
+        'DIRECTOR_FILE_NUMBER': ['ACCESSION_NUMBER', 'DIRECTOR_SEQNUM', 'FILE_NUMBER'],
+        'CHIEF_COMPLIANCE_OFFICER': [
+            'ACCESSION_NUMBER', 'CCO_SEQNUM', 'CCO_NAME', 'CRD_NUMBER', 'CCO_ADDRESS1', 'CCO_ADDRESS2',
+            'CCO_CITY', 'STATE', 'COUNTRY', 'CCO_ZIP', 'IS_CHANGED_SINCE_LAST_FILING'
+        ],
+        'CCO_EMPLOYER': ['ACCESSION_NUMBER', 'CCO_SEQNUM', 'CCO_EMPLOYER_NAME', 'CCO_EMPLOYER_ID'],
+        'REGISTRANT_REPORTING_SERIES': ['ACCESSION_NUMBER', 'SOURCE', 'SERIES_NAME', 'SERIES_ID'],
+        'RELEASE_NUMBER': ['ACCESSION_NUMBER', 'RELEASE_NUMBER'],
+        'PRINCIPAL_UNDERWRITER': [
+            'ACCESSION_NUMBER', 'UNDERWRITER_NAME', 'FILE_NUM', 'CRD_NUM', 'UNDERWRITER_LEI',
+            'STATE', 'COUNTRY', 'IS_AFFILIATED'
+        ],
+        'PUBLIC_ACCOUNTANT': [
+            'ACCESSION_NUMBER', 'PUB_ACCOUNTANT_NAME', 'PCAOB_NUM', 'PUB_ACCOUNTANT_LEI',
+            'STATE', 'COUNTRY'
+        ],
+        'VALUATION_METHOD_CHANGE': [
+            'ACCESSION_NUMBER', 'VALUATION_METHOD_CHANGE_SEQNUM', 'DATE_OF_CHANGE', 'CHANGE_EXPLANATION',
+            'ASSET_TYPE', 'ASSET_TYPE_OTHER_DESC', 'INVESTMENT_TYPE', 'STATUTORY_REGULATORY_BASIS'
+        ],
+        'VALUATION_METHOD_CHANGE_SERIES': [
+            'ACCESSION_NUMBER', 'VALUATION_METHOD_CHANGE_SEQNUM', 'SERIES_NAME', 'SERIES_ID'
+        ],
+        'FUND_REPORTED_INFO': [
+            'FUND_ID', 'ACCESSION_NUMBER', 'FUND_NAME', 'SERIES_ID', 'LEI', 'IS_FIRST_FILING',
+            'AUTHORIZED_SHARES_CNT', 'ADDED_NEW_SHARES_CNT', 'TERMINATED_SHARES_CNT', 'IS_ETF',
+            'IS_ETMF', 'IS_INDEX', 'IS_MULTI_INVERSE_INDEX', 'IS_INTERVAL', 'IS_FUND_OF_FUND',
+            'IS_MASTER_FEEDER', 'IS_MONEY_MARKET', 'IS_TARGET_DATE', 'IS_UNDERLYING_FUND',
+            'IS_FUND_TYPE_NA', 'IS_INDEX_AFFILIATED', 'IS_INDEX_EXCLUSIVE', 'RETURN_B4_FEES_AND_EXPENSES',
+            'RETURN_AFTR_FEES_AND_EXPENSES', 'STDV_B4_FEES_AND_EXPENSES', 'STDV_AFTR_FEES_AND_EXPENSES',
+            'IS_NON_DIVERSIFIED', 'IS_FOREIGN_SUBSIDIARY', 'IS_SEC_LENDING_AUTHORIZED', 'DID_LEND_SECURITIES',
+            'IS_COLLATERAL_LIQUIDATED', 'IS_IMPACTED_ADVERSELY', 'IS_PYMNT_REV_SHARING_SPLIT',
+            'IS_PYMNT_NON_REV_SHARING_SPLIT', 'IS_PYMNT_ADMIN_FEE', 'IS_PYMNT_CASH_COLLATERAL_FEE',
+            'IS_PYMNT_INDEMNI_FEE', 'IS_PYMNT_OTHER', 'IS_PYMNT_NA', 'OTHER_FEE_DESC',
+            'AVG_VALUE_SEC_LOAN', 'NET_INCOME_SEC_LENDING', 'IS_RELYON_RULE_10F_3', 'IS_RELYON_RULE_12D1_1',
+            'IS_RELYON_RULE_15A_4', 'IS_RELYON_RULE_17A_6', 'IS_RELYON_RULE_17A_7', 'IS_RELYON_RULE_17A_8',
+            'IS_RELYON_RULE_17E_1', 'IS_RELYON_RULE_22D_1', 'IS_RELYON_RULE_23C_1', 'IS_RELYON_RULE_32A_4',
+            'IS_RELYON_RULE_6C_11', 'IS_RELYON_RULE_12D1_4', 'IS_RELYON_RULE_12D1G', 'IS_RELYON_RULE_18F_4',
+            'IS_RELYON_RULE_18F_4C4', 'IS_RELYON_RULE_18F_4C2', 'IS_RELYON_RULE_18F_4DI', 'IS_RELYON_RULE_18F_4DII',
+            'IS_RELYON_RULE_18F_4E', 'IS_RELYON_RULE_18F_4F', 'IS_RELYON_RULE_NA', 'HAS_EXP_LIMIT',
+            'HAS_EXP_REDUCED_WAIVED', 'HAS_EXP_SUBJ_RECOUP', 'HAS_EXP_RECOUPED', 'HAS_XAGENT_HIRED_FIRED_MI',
+            'HAS_PRICING_SRVC_HIRED_FIRED', 'HAS_CUSTODIAN_HIRED_FIRED_MI', 'HAS_SH_SRVC_HIRED_FIRED',
+            'HAS_ADMIN_HIRED_FIRED', 'AGG_COMMISSION', 'AGG_PRINCIPAL', 'DID_PAY_BROKER_RESEARCH',
+            'MONTHLY_AVG_NET_ASSETS', 'DAILY_AVG_NET_ASSETS', 'HAS_LINE_OF_CREDIT', 'HAS_INTERFUND_LENDING',
+            'HAS_INTERFUND_BORROWING', 'HAS_SWING_PRICING', 'SWING_FACTOR_UPPER_LIMIT',
+            'DID_MAKE_RIGHTS_OFFERING', 'DID_MAKE_SECOND_OFFERING', 'IS_SECONDARY_COMMON',
+            'IS_SECONDARY_PREFERRED', 'IS_SECONDARY_WARRANTS', 'IS_SECONDARY_CONVERTIBLES',
+            'IS_SECONDARY_BONDS', 'IS_SECONDARY_OTHER', 'OTHER_SECONDARY_DESC', 'DID_REPURCHASE_SECURITY',
+            'IS_REPUR_COMMON', 'IS_REPUR_PREFERRED', 'IS_REPUR_WARRANTS', 'IS_REPUR_CONVERTIBLES',
+            'IS_REPUR_BONDS', 'IS_REPUR_OTHER', 'OTHER_REPUR_DESC', 'IS_LONG_TERM_DEBT_DEFAULT',
+            'IS_ACCUM_DIVIDEND_IN_ARREARS', 'IS_SECURITY_MAT_MODIFIED', 'MANAGEMENT_FEE',
+            'NET_OPERATING_EXPENSES', 'MARKET_PRICE_PER_SHARE', 'NAV_PER_SHARE',
+            'HAS_XAGENT_HIRED_FIRED_CE', 'HAS_CUSTODIAN_HIRED_FIRED_CE'
+        ],
+        'SHARES_OUTSTANDING': ['FUND_ID', 'CLASS_NAME', 'CLASS_ID', 'TICKER'],
+        'FEEDER_FUNDS': [
+            'FUND_ID', 'FUND_NAME', 'REGISTERED_FILE_NUM', 'REGISTERED_SERIES_ID',
+            'REGISTERED_FUND_LEI', 'UNREGISTERED_FILE_NUM', 'UNREGISTERED_FUND_LEI'
+        ],
+        'MASTER_FUNDS': ['FUND_ID', 'FUND_NAME', 'FILE_NUM', 'SEC_FILE_NUM', 'FUND_LEI'],
+        'FOREIGN_INVESTMENT': ['FUND_ID', 'FOREIGN_SUBSIDIARY_NAME', 'FOREIGN_SUBSIDIARY_LEI'],
+        'SECURITY_LENDING': [
+            'FUND_ID', 'SECURITY_LENDING_SEQNUM', 'SECURITIES_AGENT_NAME', 'SECURITIES_AGENT_LEI',
+            'IS_AFFILIATED', 'SECURITY_AGENT_IDEMNITY', 'DID_INDEMNIFICATION_RIGHTS'
+        ],
+        'SEC_LENDING_INDEMNITY_PROVIDER': [
+            'FUND_ID', 'SECURITY_LENDING_SEQNUM', 'INDEMNITY_PROVIDER_NAME', 'INDEMNITY_PROVIDER_LEI'
+        ],
+        'COLLATERAL_MANAGER': [
+            'FUND_ID', 'COLLATERAL_MANAGER_NAME', 'COLLATERAL_MANAGER_LEI', 'IS_AFFILIATED',
+            'IS_AFFILIATED_WITH_FUND'
+        ],
+        'ADVISER': [
+            'FUND_ID', 'SOURCE', 'ADVISER_TYPE', 'ADVISER_NAME', 'FILE_NUM', 'CRD_NUM',
+            'ADVISER_LEI', 'STATE', 'COUNTRY', 'IS_AFFILIATED', 'IS_ADVISOR_HIRED',
+            'ADVISOR_START_DATE', 'ADVISOR_TERMINATED_DATE'
+        ],
+        'TRANSFER_AGENT': [
+            'FUND_ID', 'SOURCE', 'TRANSFERAGENT_NAME', 'FILE_NUM', 'TRANSFERAGENT_LEI',
+            'STATE', 'COUNTRY', 'IS_AFFILIATED', 'IS_SUBTRANSFER_AGENT'
+        ],
+        'PRICING_SERVICE': [
+            'FUND_ID', 'PRICING_SERVICE_NAME', 'PRICING_SERVICE_LEI', 'OTHER_IDENTIFYING_NUM_DESC',
+            'STATE', 'COUNTRY', 'IS_AFFILIATED'
+        ],
+        'CUSTODIAN': [
+            'FUND_ID', 'SOURCE', 'CUSTODIAN_NAME', 'CUSTODIAN_LEI', 'STATE', 'COUNTRY',
+            'IS_AFFILIATED', 'IS_SUB_CUSTODIAN', 'CUSTODY_TYPE', 'OTHER_CUSTODIAN_DESC'
+        ],
+        'SHAREHOLDER_SERVICING_AGENT': [
+            'FUND_ID', 'AGENT_NAME', 'AGENT_LEI', 'OTHER_IDENTIFYING_NUM_DESC', 'STATE',
+            'COUNTRY', 'IS_AFFILIATED', 'IS_SUBSHARE'
+        ],
+        'ADMIN': [
+            'FUND_ID', 'ADMIN_NAME', 'ADMIN_LEI', 'OTHER_IDENTIFYING_NUM', 'STATE',
+            'COUNTRY', 'IS_AFFILIATED', 'IS_SUB_ADMIN'
+        ],
+        'BROKER_DEALER': [
+            'FUND_ID', 'BROKER_DEALER_NAME', 'FILE_NUM', 'CRD_NUM', 'BROKER_DEALER_LEI',
+            'STATE', 'COUNTRY', 'COMMISSION'
+        ],
+        'BROKER': [
+            'FUND_ID', 'BROKER_NAME', 'FILE_NUM', 'CRD_NUM', 'BROKER_LEI', 'STATE',
+            'COUNTRY', 'GROSS_COMMISSION'
+        ],
+        'PRINCIPAL_TRANSACTION': [
+            'FUND_ID', 'PRINCIPAL_NAME', 'FILE_NUM', 'CRD_NUM', 'PRINCIPAL_LEI', 'STATE',
+            'COUNTRY', 'PRINCIPAL_TOTAL_PURCHASE_SALE'
+        ],
+        'LINE_OF_CREDIT_DETAIL': [
+            'FUND_ID', 'LINE_OF_CREDIT_SEQNUM', 'IS_CREDIT_LINE_COMMITTED', 'LINE_OF_CREDIT_SIZE',
+            'CREDIT_TYPE', 'IS_CREDIT_LINE_USED', 'AVERAGE_CREDIT_LINE_USED', 'DAYS_CREDIT_USED'
+        ],
+        'LINE_OF_CREDIT_INSTITUTION': ['FUND_ID', 'LINE_OF_CREDIT_SEQNUM', 'CREDIT_INSTITUTION_NAME'],
+        'CREDIT_USER': ['FUND_ID', 'LINE_OF_CREDIT_SEQNUM', 'FUND_NAME', 'SEC_FILE_NUM'],
+        'INTER_FUND_LENDING_DETAIL': ['FUND_ID', 'LENDING_LOAN_AVERAGE', 'LENDING_DAYS_OUTSTANDING'],
+        'INTER_FUND_BORROWING_DETAIL': ['FUND_ID', 'BORROWING_LOAN_AVERAGE', 'BORROWING_DAYS_OUTSTANDING'],
+        'SECURITY_RELATED_ITEM': [
+            'FUND_ID', 'SECURITY_RELATED_ITEM_SEQNUM', 'DESCRIPTION', 'SECURITY_CLASS_TITLE',
+            'OTHER_SECURITY_DESCRIPTION', 'EXCHANGE', 'TICKER_SYMBOL'
+        ],
+        'RIGHTS_OFFERING_FUND': [
+            'FUND_ID', 'IS_RIGHTS_OFFER_COMMON', 'IS_RIGHTS_OFFER_PREFERRED', 'IS_RIGHTS_OFFER_WARRANTS',
+            'IS_RIGHTS_OFFER_CONVERTIBLES', 'IS_RIGHTS_OFFER_BONDS', 'IS_RIGHTS_OFFER_OTHER',
+            'RIGHTS_OFFER_DESC', 'PCT_PARTCI_PRIMARY_OFFERING'
+        ],
+        'LONGTERM_DEBT_DEFAULT': [
+            'FUND_ID', 'DEFAULT_NATURE', 'DEFAULT_DATE', 'DEFAULT_AMNT_PER_1000', 'TOTAL_DEFAULT_AMNT'
+        ],
+        'DIVIDENDS_IN_ARREAR': ['FUND_ID', 'ISSUE_TITLE', 'AMOUNT_PER_SHARE_IN_ARREAR'],
+        'SECURITY_EXCHANGE': ['FUND_ID', 'FUND_EXCHANGE', 'FUND_TICKER_SYMBOL'],
+        'AUTHORIZED_PARTICIPANT': [
+            'FUND_ID', 'PARTICIPANT_NAME', 'FILE_NUM', 'CRD_NUM', 'PARTICIPANT_LEI',
+            'PURCHASE_VALUE', 'REDEEM_VALUE'
+        ],
+        'ETF': [
+            'FUND_ID', 'FUND_NAME', 'SERIES_ID', 'IS_COLLATERAL_REQUIRED', 'NUM_SHARES_PER_CREATION_UNIT',
+            'PURCHASED_AVG_PCT_CASH', 'PURCHASED_STDV_PCT_CASH', 'PURCHASED_AVG_PCT_NON_CASH',
+            'PURCHASED_STDV_PCT_NON_CASH', 'REDEEMED_AVG_PCT_CASH', 'REDEEMED_STDV_PCT_CASH',
+            'REDEEMED_AVG_PCT_NON_CASH', 'REDEEMED_STDV_PCT_NON_CASH', 'PURCH_AVG_FEE_PER_UNIT',
+            'PURCH_AVG_FEE_SAME_DAY', 'PURCH_AVG_FEE_PERCENTAGE', 'PURCH_AVG_FEE_CASH_PER_UNIT',
+            'PURCH_AVG_FEE_CASH_SAME_DAY', 'PURCH_AVG_FEE_CASH_PERCENTAGE', 'REDEEM_AVG_FEE_PER_UNIT',
+            'REDEEM_AVG_FEE_SAME_DAY', 'REDEEM_AVG_FEE_PERCENTAGE', 'REDEEM_AVG_FEE_CASH_PER_UNIT',
+            'REDEEM_AVG_FEE_CASH_SAME_DAY', 'REDEEM_AVG_FEE_CASH_PERCENTAGE',
+            'IS_PERF_TRACKED_AFFILIA_PERSON', 'IS_PERF_TRACKED_EXCLUSIVELY',
+            'ANNUAL_DIFF_B4_FEE_EXPENSE', 'ANNUAL_DIFF_AFTER_FEE_EXPENSE',
+            'ANNUAL_STDV_B4_FEE_EXPENSE', 'ANNUAL_STDV_AFTER_FEE_EXPENSE', 'IS_FUND_IN_KIND_ETF'
+        ],
+        'DEPOSITOR': [
+            'ACCESSION_NUMBER', 'DEPOSITOR_NAME', 'CRD_NUM', 'DEPOSITOR_LEI', 'STATE',
+            'COUNTRY', 'ULTIMATE_PARENT_NAME'
+        ],
+        'UIT_ADMIN': [
+            'ACCESSION_NUMBER', 'UIT_ADMIN_NAME', 'UIT_ADMIN_LEI', 'OTHER_IDENTIFYING_NUM',
+            'STATE', 'COUNTRY', 'IS_AFFILIATED', 'IS_SUB_ADMIN'
+        ],
+        'UIT': [
+            'ACCESSION_NUMBER', 'IS_ADMIN_HIRED_FIRED', 'IS_SEPERATE_ACCT', 'EXISTING_SERIES_CNT',
+            'NEW_SERIES_CNT', 'NEW_SERIES_AGG_VALUE', 'SERIES_CURRENT_PROSPECTUS',
+            'SERIES_CNT_ADDITIONAL_UNITS', 'TOTAL_VALUE_ADDITIONAL_UNIT', 'VALUE_UNIT_PLACED_SUBSEQUENT',
+            'TOTAL_ASSET_FOR_ALL_SERIES', 'SERIES_ID', 'NUM_CONTRACTS', 'IS_RELYON_RULE_6C_7',
+            'IS_RELYON_RULE_11A_2', 'IS_RELYON_RULE_12D1_4', 'IS_RELYON_RULE_12D1G'
+        ],
+        'SERIES_CIK': ['ACCESSION_NUMBER', 'SERIES_CIK'],
+        'SPONSOR': ['ACCESSION_NUMBER', 'SPONSOR_NAME', 'CRD_NUM', 'SPONSOR_LEI', 'STATE', 'COUNTRY'],
+        'TRUSTEE': ['ACCESSION_NUMBER', 'TRUSTEE_NAME', 'STATE', 'COUNTRY'],
+        'CONTRACT_SECURITY': [
+            'ACCESSION_NUMBER', 'SECURITY_NAME', 'CONTRACT_ID', 'TOTAL_ASSET', 'NUM_CONTRACT_SOLD',
+            'GROSS_PREMIUM_RECEIVED', 'GROSS_PREMIUM_RECEIVED_SEC1035', 'NUM_CONTRACT_AFFECTED_PAID',
+            'CONTRACT_VALUE_REDEEMED', 'CONTRAC_VALUE_REDEEMED_SEC1035', 'NUM_CONTRACT_AFFECTED_REDEEMED'
+        ],
+        'DIVESTMENT': [
+            'ACCESSION_NUMBER', 'ISSUER_NAME', 'TICKER', 'CUSIP', 'DIVESTED_NUM_SHARES',
+            'DIVESTED_DATE', 'STATUTE_NAME'
+        ],
+        'REGISTRANT_HELDS_SECURITY': ['ACCESSION_NUMBER', 'TICKER', 'CUSIP', 'TOTAL_NUM_SHARES']
+    }
 
-    # Use all available cores for processing
-    available_cores = cpu_count()
-    with ProcessPoolExecutor(max_workers=available_cores) as executor:
-        futures = {executor.submit(process_ncen, zip_file, search_terms, verbose): zip_file for zip_file in zip_files}
+    # Build full headers: core + prefixed TSV fields
+    headers = core_headers.copy()
+    for tsv, fields in all_tsv_fields.items():
+        for field in fields:
+            prefixed = f"{tsv}_{field}"
+            if prefixed not in headers:  # Avoid duplicates
+                headers.append(prefixed)
 
+    # Initialize CSV with all headers and log the action
+    pd.DataFrame(columns=headers).to_csv(output_file, index=False, header=True, mode='w', encoding='utf-8')
+    if verbose and log_file:
+        logging.basicConfig(filename=log_file, level=logging.INFO, format='%(asctime)s - %(message)s')
+        logging.info(f"Initialized CSV with {len(headers)} headers: {output_file}")
+
+    # Process ZIP files sequentially
+    for zip_file in tqdm.tqdm(zip_files, desc="Files Processed", unit="file"):
+        try:
+            results = search_ncen_swaps(zip_file, search_terms, verbose, log_file=log_file)
+            if results:
+                df = pd.DataFrame(results)
+                # Ensure DataFrame columns match all headers order
+                df = df.reindex(columns=headers, fill_value=None)
+                df.to_csv(output_file, index=False, header=False, mode='a', encoding='utf-8')
+                if verbose and log_file:
+                    logging.info(f"Wrote {len(df)} items to CSV for {zip_file} (total columns: {len(df.columns)})")
+        except Exception as e:
+            if verbose and log_file:
+                logging.info(f"An error occurred while processing {zip_file}: {str(e)}")
+
+    gc.collect()
+    return output_file
+def process_nmfp_tsv_file(tsv_name, row, zip_file, verbose=False):
+    import zipfile
+    import pandas as pd
+    import logging
+
+    def log_safe(msg):
         if verbose:
-            with tqdm.tqdm(total=len(zip_files), desc="Files Processed", unit="file") as file_progress:
-                for future in as_completed(futures):
-                    try:
-                        results = future.result()
-                        for date, item in results:
-                            result_queue.put((futures[future], date, item))  # Store file, date, and item
-                    except Exception as e:
-                        if verbose:
-                            print(f"An error occurred while processing {futures[future]}: {str(e)}")
-                    finally:
-                        if verbose:
-                            file_progress.update(1)
+            logging.info(msg)
 
-                    # Write results to CSV as they become available
-                    while not result_queue.empty():
-                        _, date, item = result_queue.get()
-                        with open(output_file, 'a', newline='') as csvfile:
-                            # Ensure all headers are present or handle missing ones
-                            item = {k: item.get(k, '') for k in headers}
-                            pd.DataFrame([item]).to_csv(csvfile, index=False, header=False, mode='a')
-                        if verbose:
-                            print(f"Wrote item from {date} to CSV")
+    holding_summary = {}
+    try:
+        with zipfile.ZipFile(zip_file, 'r') as zip_ref:
+            tsv_filename = f"NMFP_{tsv_name}.tsv"
+            if tsv_filename not in zip_ref.namelist():
+                log_safe(f"Warning: {tsv_filename} not found in {zip_file}")
+                return holding_summary
+            with zip_ref.open(tsv_filename) as tsvfile:
+                df = pd.read_csv(tsvfile, delimiter='\t', low_memory=False)
+                # Handle TSVs with ACCESSION_NUMBER
+                if tsv_name in ['SUBMISSION', 'FUND', 'SERIESLEVELINFO', 'MASTERFEEDERFUND', 'ADVISER', 'ADMINISTRATOR', 'TRANSFERAGENT',
+                                'SERIESSHADOWPRICE_L', 'CLASSLEVELINFO', 'NETASSETVALUEPERSHARE_L', 'LIQUIDASSETSDETAILS',
+                                'SEVENDAYGROSSYIELD', 'DLYNETASSETVALUEPERSHARS']:
+                    match_row = df[df['ACCESSION_NUMBER'] == row['ACCESSION_NUMBER']]
+                    if not match_row.empty:
+                        for col in match_row.columns:
+                            prefixed_col = f"{tsv_name}_{col}"
+                            holding_summary[prefixed_col] = match_row.iloc[0][col]
+                        log_safe(f"Matched {tsv_name} for ACCESSION_NUMBER {row['ACCESSION_NUMBER']}")
+                    else:
+                        log_safe(f"No match for {tsv_name} with ACCESSION_NUMBER {row['ACCESSION_NUMBER']}")
+                # Handle TSVs with SECURITY_ID
+                elif tsv_name in ['SCHPORTFOLIOSECURITIES', 'COLLATERALISSUERS', 'NRSRO', 'DEMANDFEATURE', 'GUARANTOR', 'ENHANCEMENTPROVIDER']:
+                    match_row = df[df['SECURITY_ID'] == row['SECURITY_ID']]
+                    if not match_row.empty:
+                        for col in match_row.columns:
+                            prefixed_col = f"{tsv_name}_{col}"
+                            holding_summary[prefixed_col] = match_row.iloc[0][col]
+                        log_safe(f"Matched {tsv_name} for SECURITY_ID {row['SECURITY_ID']}")
+                    else:
+                        log_safe(f"No match for {tsv_name} with SECURITY_ID {row['SECURITY_ID']}")
+    except Exception as e:
+        log_safe(f"Error processing {tsv_filename} in {zip_file}: {str(e)}")
+    return holding_summary
+def search_nmfp_swaps(zip_file, search_terms, verbose=False, debug=False, log_file="SecNmfp/repo_process.log"):
+    import os
+    import zipfile
+    import pandas as pd
+    import tqdm
+    from datetime import datetime
+    from concurrent.futures import ProcessPoolExecutor, as_completed
+    import logging
 
-    gc.collect()  # Memory management
-def process_ncen(zip_file, search_terms, verbose=False):
-    results = []
-    for term in search_terms:
-        summary = search_ncen_data(zip_file, term, verbose)
-        
-        # Convert to datetime if needed
-        for item in summary:
-            date = datetime.fromtimestamp(item['FILENAME_TIMESTAMP']) if 'FILENAME_TIMESTAMP' in item else datetime(1970, 1, 1)
-            results.append((date, item))
-    return results
+    # Set up logging with default file
+    if verbose and log_file:
+        log_dir = os.path.dirname(log_file) or '.'
+        if log_dir and not os.path.exists(log_dir):
+            os.makedirs(log_dir, exist_ok=True)
+        logging.basicConfig(filename=log_file, level=logging.INFO, format='%(asctime)s - %(message)s', filemode='a')
+    
+    summary = []
+    
+    def log_safe(msg):
+        if verbose:
+            logging.info(msg)
+    
+    log_safe(f"Starting {zip_file}")
+    
+    try:
+        base_name = os.path.basename(zip_file)
+        year = base_name[:4]
+        quarter_char = base_name[4]
+        quarter = {'q': 1, '1': 1, 'w': 2, '2': 2, 'e': 3, '3': 3, 'r': 4, '4': 4}.get(quarter_char.lower(), None)
+
+        if quarter is not None:
+            quarter_start_date = datetime(int(year), quarter*3 - 2, 1)
+            timestamp = int(quarter_start_date.timestamp())
+        else:
+            timestamp = None
+            log_safe(f"Warning: Could not parse quarter from {zip_file}")
+            return summary
+
+        with zipfile.ZipFile(zip_file, 'r') as zip_ref:
+            if 'NMFP_SCHPORTFOLIOSECURITIES.tsv' not in zip_ref.namelist():
+                log_safe(f"Warning: {zip_file} does not contain NMFP_SCHPORTFOLIOSECURITIES.tsv")
+                return summary
+
+            chunksize = 100000
+            with zip_ref.open('NMFP_SCHPORTFOLIOSECURITIES.tsv') as tsvfile:
+                total_rows = sum(1 for _ in tsvfile)
+                tsvfile.seek(0)  # Reset file pointer after counting
+
+            with tqdm.tqdm(total=total_rows, desc=f"Processing {zip_file}", unit="row") as pbar:
+                for chunk in pd.read_csv(zip_ref.open('NMFP_SCHPORTFOLIOSECURITIES.tsv'), delimiter='\t', chunksize=chunksize,
+                                       low_memory=False, encoding='utf-8', on_bad_lines='skip'):
+                    if 'FILENAME_TIMESTAMP' not in chunk.columns:
+                        chunk['FILENAME_TIMESTAMP'] = timestamp
+
+                    string_columns = ['NAMEOFISSUER', 'TITLEOFISSUER', 'BRIEFDESCRIPTION', 'ACCESSION_NUMBER', 'SECURITY_ID', 'CUSIP_NUMBER']
+                    log_safe(f"Chunk columns: {chunk.columns.tolist()}")
+                    log_safe(f"Sample NAMEOFISSUER: {chunk['NAMEOFISSUER'].head().tolist() if 'NAMEOFISSUER' in chunk.columns else 'Column missing'}")
+                    chunk[string_columns] = chunk[string_columns].fillna('').astype(str)
+                    
+                    def contains_search_term(row):
+                        for term in search_terms:
+                            for col in string_columns:
+                                if pd.notna(row[col]) and term.lower() in str(row[col]).lower():
+                                    return True
+                        return False
+                    
+                    keyword_securities = chunk[chunk.apply(contains_search_term, axis=1)]
+                    log_safe(f"Processed chunk with {len(chunk)} rows, found {len(keyword_securities)} matches for {', '.join(search_terms)} in {zip_file}")
+
+                    if not keyword_securities.empty:
+                        tsv_files = [
+                            'SUBMISSION', 'FUND', 'SERIESLEVELINFO', 'MASTERFEEDERFUND', 'ADVISER', 'ADMINISTRATOR', 'TRANSFERAGENT',
+                            'SERIESSHADOWPRICE_L', 'CLASSLEVELINFO', 'NETASSETVALUEPERSHARE_L', 'LIQUIDASSETSDETAILS',
+                            'SEVENDAYGROSSYIELD', 'DLYNETASSETVALUEPERSHARS', 'SCHPORTFOLIOSECURITIES', 'COLLATERALISSUERS',
+                            'NRSRO', 'DEMANDFEATURE', 'GUARANTOR', 'ENHANCEMENTPROVIDER'
+                        ]
+                        
+                        with ProcessPoolExecutor() as executor:
+                            for index, row in keyword_securities.iterrows():
+                                holding_summary = {
+                                    'ACCESSION_NUMBER': row['ACCESSION_NUMBER'],
+                                    'SECURITY_ID': row['SECURITY_ID'],
+                                    'FILENAME_TIMESTAMP': timestamp,
+                                    'FILING_DATE': None,
+                                    'NAMEOFISSUER': row['NAMEOFISSUER'] if 'NAMEOFISSUER' in row else None,
+                                    'TITLEOFISSUER': row['TITLEOFISSUER'] if 'TITLEOFISSUER' in row else None,
+                                    'CUSIP_NUMBER': row['CUSIP_NUMBER'] if 'CUSIP_NUMBER' in row else None,
+                                    'LEI': row['LEI'] if 'LEI' in row else None,
+                                    'ISIN': row['ISIN'] if 'ISIN' in row else None,
+                                    'CIK': row['CIK'] if 'CIK' in row else None,
+                                    'INVESTMENTCATEGORY': row['INVESTMENTCATEGORY'] if 'INVESTMENTCATEGORY' in row else None,
+                                    'BRIEFDESCRIPTION': row['BRIEFDESCRIPTION'] if 'BRIEFDESCRIPTION' in row else None,
+                                    'REPURCHASEAGREEMENTOPENFLAG': row['REPURCHASEAGREEMENTOPENFLAG'] if 'REPURCHASEAGREEMENTOPENFLAG' in row else None,
+                                    'INVESTMENTMATURITYDATEWAM': row['INVESTMENTMATURITYDATEWAM'] if 'INVESTMENTMATURITYDATEWAM' in row else None,
+                                    'YIELDOFTHESECURITYASOFREPORTIN': row['YIELDOFTHESECURITYASOFREPORTIN'] if 'YIELDOFTHESECURITYASOFREPORTIN' in row else None,
+                                    'INCLUDINGVALUEOFANYSPONSORSUPP': row['INCLUDINGVALUEOFANYSPONSORSUPP'] if 'INCLUDINGVALUEOFANYSPONSORSUPP' in row else None,
+                                    'EXCLUDINGVALUEOFANYSPONSORSUPP': row['EXCLUDINGVALUEOFANYSPONSORSUPP'] if 'EXCLUDINGVALUEOFANYSPONSORSUPP' in row else None,
+                                    'PERCENTAGEOFMONEYMARKETFUNDNET': row['PERCENTAGEOFMONEYMARKETFUNDNET'] if 'PERCENTAGEOFMONEYMARKETFUNDNET' in row else None,
+                                    'DAILYLIQUIDASSETSECURITYFLAG': row['DAILYLIQUIDASSETSECURITYFLAG'] if 'DAILYLIQUIDASSETSECURITYFLAG' in row else None,
+                                    'WEEKLYLIQUIDASSETSECURITYFLAG': row['WEEKLYLIQUIDASSETSECURITYFLAG'] if 'WEEKLYLIQUIDASSETSECURITYFLAG' in row else None,
+                                    'YYYYQQ': None
+                                }
+
+                                futures = [executor.submit(process_nmfp_tsv_file, tsv_name, row, zip_file, verbose) 
+                                          for tsv_name in tsv_files]
+                                for future in as_completed(futures):
+                                    tsv_data = future.result()
+                                    holding_summary.update(tsv_data)
+
+                                if 'SUBMISSION_REPORT_ENDING_PERIOD' in holding_summary:
+                                    report_date = pd.to_datetime(holding_summary['SUBMISSION_REPORT_ENDING_PERIOD'], errors='coerce')
+                                    if not pd.isna(report_date):
+                                        holding_summary['YYYYQQ'] = f"{report_date.year}Q{((report_date.month-1)//3) + 1}"
+                                    else:
+                                        holding_summary['YYYYQQ'] = None
+                                else:
+                                    holding_summary['YYYYQQ'] = None
+
+                                summary.append(holding_summary)
+                                if verbose and index % 10 == 0:
+                                    log_safe(f"Processed {index} securities for {zip_file}")
+
+                    pbar.update(chunksize)
+
+    except Exception as e:
+        log_safe(f"Error processing {zip_file}: {str(e)}")
+    
+    log_safe(f"Returning {len(summary)} results for {zip_file}")
+    return summary
+def search_nmfp(search_keywords, verbose=False):
+    import os
+    import pandas as pd
+    import tqdm
+    from datetime import datetime
+    import gc
+    import logging
+
+    secnmfp_path = os.path.join(ROOT_DIR, "SecNmfp")
+    os.makedirs(secnmfp_path, exist_ok=True)
+    
+    # Get and sort ZIP files by date
+    zip_files = [os.path.join(secnmfp_path, f) for f in os.listdir(secnmfp_path) if f.endswith('.zip')]
+    zip_files = [os.path.normpath(path) for path in zip_files]
+    def log_safe(msg):
+        if verbose:
+            logging.info(msg)
+    def get_file_date(file):
+        base_name = os.path.basename(file)
+        year = base_name[:4]
+        quarter_char = base_name[4]
+        quarter = {'q': 1, '1': 1, 'w': 2, '2': 2, 'e': 3, '3': 3, 'r': 4, '4': 4}.get(quarter_char.lower(), None)
+        if quarter is not None:
+            return datetime(int(year), quarter*3 - 2, 1)
+        return datetime.min  # Fallback for invalid dates
+    
+    zip_files.sort(key=get_file_date)  # Sort files chronologically
+    search_terms = [term.strip() for term in search_keywords.split(',')]
+    
+    output_file = os.path.join(ROOT_DIR, "SecNmfp", f"{search_keywords.replace(',', '_')}_summary_results.csv")
+    log_file = os.path.join(ROOT_DIR, "SecNmfp", f"{search_keywords.replace(',', '_')}_process.log")
+
+    # Core headers from SCHPORTFOLIOSECURITIES and derived
+    core_headers = [
+        'ACCESSION_NUMBER', 'SECURITY_ID', 'FILENAME_TIMESTAMP', 'FILING_DATE', 'ISSUER_NAME',
+        'SECURITY_DESCRIPTION', 'CUSIP', 'TICKER', 'VALUE', 'AMOUNT', 'CURRENCY', 'MATURITY_DATE',
+        'IS_DAILY_LIQUID', 'IS_WEEKLY_LIQUID', 'IS_REDEEMABLE', 'IS_REPURCHASE_AGREEMENT',
+        'RATE', 'PORTFOLIO_PERCENTAGE', 'FAIR_VALUE', 'CATEGORY', 'COUNTRY', 'INDUSTRY',
+        'RATING', 'IS_DERIVATIVE', 'DERIVATIVE_TYPE', 'YYYYQQ'
+    ]
+
+    # All fields from NMFP README
+    all_tsv_fields = {
+        'SUBMISSION': [
+            'ACCESSION_NUMBER', 'FILING_DATE', 'REPORT_ENDING_PERIOD', 'IS_LAST_FILING', 'SUB_TYPE'
+        ],
+        'FUND': [
+            'ACCESSION_NUMBER', 'FILENUMBER', 'SERIESID', 'FUND_TYPE', 'SUCCESSOR_FUND_NAME',
+            'SUCCESSOR_FUND_LEI', 'ACQUIRED_FUND_NAME', 'ACQUIRED_FUND_LEI'
+        ],
+        'SERIESLEVELINFO': [
+            'ACCESSION_NUMBER', 'SERIESID', 'FUND_NAME', 'FUND_LEI', 'FUND_ADDRESS1', 'FUND_ADDRESS2',
+            'FUND_CITY', 'FUND_STATE', 'FUND_COUNTRY', 'FUND_ZIP', 'FUND_PHONE', 'IS_MONEY_MARKET',
+            'IS_GOVERNMENT', 'IS_PRIME', 'IS_TAX_EXEMPT', 'IS_RETAIL', 'IS_INSTITUTIONAL',
+            'IS_STABLE_NAV', 'IS_STABLE_VALUE', 'IS_MASTER_FEEDER', 'IS_FEEDER', 'IS_ETF',
+            'TOTAL_ASSETS', 'TOTAL_LIABILITIES', 'NET_ASSETS', 'WAM', 'WAL', 'DAILY_LIQUID_ASSETS',
+            'WEEKLY_LIQUID_ASSETS', 'SHARES_OUTSTANDING', 'NAV_PER_SHARE', 'SEVEN_DAY_LIQUIDITY',
+            'SEVEN_DAY_YIELD', 'WEEKLY_GROSS_YIELD', 'REPORT_DATE'
+        ],
+        'MASTERFEEDERFUND': [
+            'ACCESSION_NUMBER', 'SERIESID', 'FUND_TYPE', 'MASTER_FUND_NAME', 'MASTER_FUND_LEI',
+            'MASTER_FUND_FILE_NUMBER', 'MASTER_FUND_SERIES_ID'
+        ],
+        'ADVISER': [
+            'ACCESSION_NUMBER', 'ADVISORFILENUMBER', 'ADVISER_TYPE', 'ADVISER_NAME', 'ADVISER_LEI',
+            'ADVISER_ADDRESS1', 'ADVISER_ADDRESS2', 'ADVISER_CITY', 'ADVISER_STATE', 'ADVISER_COUNTRY',
+            'ADVISER_ZIP', 'ADVISER_PHONE'
+        ],
+        'ADMINISTRATOR': [
+            'ACCESSION_NUMBER', 'ADMINISTRATORNAME', 'ADMINISTRATOR_LEI', 'ADMINISTRATOR_ADDRESS1',
+            'ADMINISTRATOR_ADDRESS2', 'ADMINISTRATOR_CITY', 'ADMINISTRATOR_STATE', 'ADMINISTRATOR_COUNTRY',
+            'ADMINISTRATOR_ZIP', 'ADMINISTRATOR_PHONE'
+        ],
+        'TRANSFERAGENT': [
+            'ACCESSION_NUMBER', 'FILENUMBER', 'TRANSFERAGENT_NAME', 'TRANSFERAGENT_LEI',
+            'TRANSFERAGENT_ADDRESS1', 'TRANSFERAGENT_ADDRESS2', 'TRANSFERAGENT_CITY',
+            'TRANSFERAGENT_STATE', 'TRANSFERAGENT_COUNTRY', 'TRANSFERAGENT_ZIP', 'TRANSFERAGENT_PHONE'
+        ],
+        'SERIESSHADOWPRICE_L': [
+            'ACCESSION_NUMBER', 'SHADOW_PRICE_DATE', 'SHADOW_NAV', 'MARKET_BASED_NAV'
+        ],
+        'CLASSLEVELINFO': [
+            'ACCESSION_NUMBER', 'CLASSESID', 'CLASS_NAME', 'CLASS_LEI', 'SHARES_OUTSTANDING',
+            'NAV_PER_SHARE', 'IS_STABLE_NAV', 'IS_STABLE_VALUE'
+        ],
+        'NETASSETVALUEPERSHARE_L': [
+            'ACCESSION_NUMBER', 'CLASSESID', 'TYPE', 'NAV_DATE', 'NAV_PER_SHARE'
+        ],
+        'SCHPORTFOLIOSECURITIES': [
+            'ACCESSION_NUMBER', 'SECURITY_ID', 'ISSUER_NAME', 'SECURITY_DESCRIPTION', 'CUSIP',
+            'TICKER', 'VALUE', 'AMOUNT', 'CURRENCY', 'MATURITY_DATE', 'IS_DAILY_LIQUID',
+            'IS_WEEKLY_LIQUID', 'IS_REDEEMABLE', 'IS_REPURCHASE_AGREEMENT', 'RATE',
+            'PORTFOLIO_PERCENTAGE', 'FAIR_VALUE', 'CATEGORY', 'COUNTRY', 'INDUSTRY',
+            'RATING', 'IS_DERIVATIVE', 'DERIVATIVE_TYPE', 'AMORTIZED_COST', 'PRINCIPAL_AMOUNT',
+            'YIELD_TO_MATURITY', 'EFFECTIVE_MATURITY', 'MAXIMUM_MATURITY', 'IS_GUARANTEED'
+        ],
+        'COLLATERALISSUERS': [
+            'ACCESSION_NUMBER', 'SECURITY_ID', 'NAMEOFCOLLATERALISSUER', 'COLLATERALMATURITYDATE',
+            'VALUEOFCOLLATERALTOTHENEARESTC'
+        ],
+        'NRSRO': [
+            'ACCESSION_NUMBER', 'SECURITY_ID', 'IDENTITY', 'TYPE', 'NAMEOFNRSRO', 'RATING'
+        ],
+        'DEMANDFEATURE': [
+            'ACCESSION_NUMBER', 'SECURITY_ID', 'IDENTITYOFDEMANDFEATUREISSUER', 'DEMAND_FEATURE_TYPE'
+        ],
+        'GUARANTOR': [
+            'ACCESSION_NUMBER', 'SECURITY_ID', 'IDENTITYOFTHEGUARANTOR', 'GUARANTOR_TYPE'
+        ],
+        'ENHANCEMENTPROVIDER': [
+            'ACCESSION_NUMBER', 'SECURITY_ID', 'IDENTITYOFENHANCEMENTPROVIDER', 'TYPEOFENHANCEMENT'
+        ],
+        'LIQUIDASSETSDETAILS': [
+            'ACCESSION_NUMBER', 'TOTLIQUIDASSETSNEARPCTDATE', 'DAILY_LIQUID_ASSETS', 'WEEKLY_LIQUID_ASSETS',
+            'TOTAL_ASSETS', 'DAILY_LIQUID_PERCENTAGE', 'WEEKLY_LIQUID_PERCENTAGE'
+        ],
+        'SEVENDAYGROSSYIELD': [
+            'ACCESSION_NUMBER', 'SEVENDAYGROSSYIELDDATE', 'SEVEN_DAY_GROSS_YIELD'
+        ],
+        'DLYNETASSETVALUEPERSHARS': [
+            'ACCESSION_NUMBER', 'NAV_DATE', 'NAV_PER_SHARE'
+        ]
+    }
+
+    # Build full headers
+    headers = core_headers.copy()
+    for tsv, fields in all_tsv_fields.items():
+        for field in fields:
+            prefixed = f"{tsv}_{field}"
+            if prefixed not in headers:
+                headers.append(prefixed)
+
+    # Initialize CSV with all headers
+    pd.DataFrame(columns=headers).to_csv(output_file, index=False, header=True, mode='w', encoding='utf-8')
+    if verbose and log_file:
+        logging.basicConfig(filename=log_file, level=logging.INFO, format='%(asctime)s - %(message)s')
+        logging.info(f"Initialized CSV with {len(headers)} headers: {output_file}")
+
+    # Process ZIP files sequentially
+    for zip_file in tqdm.tqdm(zip_files, desc="Files Processed", unit="file"):
+        try:
+            results = search_nmfp_swaps(zip_file, search_terms, verbose, log_file=log_file)
+            if results:
+                log_safe(f"Appending {len(results)} rows for {zip_file}")
+                df = pd.DataFrame(results)
+                df = df.reindex(columns=headers, fill_value=None)
+                df.to_csv(output_file, index=False, header=False, mode='a', encoding='utf-8')
+                logging.info(f"Wrote {len(df)} rows to CSV for {zip_file} (total columns: {len(df.columns)})")
+            else:
+                logging.info(f"No results for {zip_file}")
+        except Exception as e:
+            logging.info(f"An error occurred while processing {zip_file}: {str(e)}")
+
+    gc.collect()
+    return output_file
 def main_search(zip_file, search_keyword, verbose=False, looking_for_swaps=False):
     import tqdm, pandas as pd
     if verbose:
@@ -4265,6 +4473,1059 @@ def write_to_csv(queue, output_file, verbose=False):
             except Exception as e:
                 if verbose:
                     print(f"Error writing to CSV: {e}")
+
+def parse_nport_xml(xml_content, file_name, search_term="GameStop", cusip="36467W109"):
+    """
+    Parse N-PORT XML content for specified search term or CUSIP.
+    """
+    print(f"Processing N-PORT XML: {file_name}")
+    try:
+        tree = etree.fromstring(xml_content)
+        ns = {'ns': 'http://www.sec.gov/edgar/nport'}
+        holdings = []
+        period_end = tree.find('.//ns:periodOfReport', ns).text if tree.find('.//ns:periodOfReport', ns) is not None else 'N/A'
+        print(f"Scanning N-PORT for {search_term} or CUSIP {cusip}...")
+        for invstOrSec in tree.findall('.//ns:invstOrSec', ns):
+            name = invstOrSec.find('ns:name', ns).text if invstOrSec.find('ns:name', ns) is not None else ''
+            sec_cusip = invstOrSec.find('ns:cusip', ns).text if invstOrSec.find('ns:cusip', ns) is not None else ''
+            if search_term.lower() in name.lower() or sec_cusip == cusip:
+                print(f"Found match: {name} (CUSIP: {sec_cusip})")
+                entry = {
+                    'CIK': tree.find('.//ns:cik', ns).text if tree.find('.//ns:cik', ns) is not None else 'N/A',
+                    'Accession': file_name.replace('.xml', ''),
+                    'Period_End': period_end,
+                    'Issuer': name,
+                    'CUSIP': sec_cusip,
+                    'Counterparty': 'N/A',
+                    'Notional_USD': 0.0,
+                    'Type': 'Holding',
+                    'Maturity_Date': 'N/A',
+                    'Yield': 'N/A'
+                }
+                deriv = invstOrSec.find('.//ns:derivativeInfo/ns:swapInfo', ns)
+                if deriv is not None:
+                    entry['Counterparty'] = deriv.find('ns:counterparty/ns:name', ns).text if deriv.find('ns:counterparty/ns:name', ns) is not None else 'N/A'
+                    entry['Notional_USD'] = float(deriv.find('ns:notionalAmt/ns:valUSD', ns).text or 0) if deriv.find('ns:notionalAmt/ns:valUSD', ns) is not None else 0.0
+                    entry['Type'] = 'Swap'
+                    print(f"Swap detected: Counterparty={entry['Counterparty']}, Notional=${entry['Notional_USD']}")
+                holdings.append(entry)
+        df = pd.DataFrame(holdings)
+        print(f"N-PORT XML processed: {len(holdings)} holdings found")
+        return df
+    except Exception as e:
+        print(f"Error parsing N-PORT XML {file_name}: {e}")
+        return pd.DataFrame()
+
+def parse_ncen_xml(xml_content, file_name):
+    """
+    Parse N-CEN XML content for fund metadata and exemptions.
+    """
+    print(f"Processing N-CEN XML: {file_name}")
+    try:
+        tree = etree.fromstring(xml_content)
+        ns = {'cen': 'http://www.sec.gov/EDGAR/ncen'}
+        period_end = tree.find('.//cen:periodOfReport', ns).text if tree.find('.//cen:periodOfReport', ns) is not None else 'N/A'
+        print(f"Scanning N-CEN for fund metadata...")
+        data = {
+            'CIK': tree.find('.//cen:cik', ns).text if tree.find('.//cen:cik', ns) is not None else 'N/A',
+            'Accession': file_name.replace('.xml', ''),
+            'Period_End': period_end,
+            'Fund_Name': tree.find('.//cen:fundName', ns).text if tree.find('.//cen:fundName', ns) is not None else 'N/A',
+            'Is_Retail': tree.find('.//cen:itemA10', ns).text == 'Y' if tree.find('.//cen:itemA10', ns) is not None else False,
+            'Exemptions': []
+        }
+        for exempt in tree.findall('.//cen:exemptiveOrders/cen:exemptiveOrder', ns):
+            order_id = exempt.find('cen:orderNumber', ns).text if exempt.find('cen:orderNumber', ns) is not None else ''
+            rule = exempt.find('cen:ruleReliedOn', ns).text if exempt.find('cen:ruleReliedOn', ns) is not None else ''
+            exemption = f"{rule} ({order_id})" if order_id else rule
+            data['Exemptions'].append(exemption)
+            print(f"Exemption found: {exemption}")
+        for lending in tree.findall('.//cen:secLending', ns):
+            borrower = lending.find('cen:borrower/cen:name', ns).text if lending.find('cen:borrower/cen:name', ns) is not None else ''
+            if borrower:
+                lending_exemption = f"SecLending ({borrower})"
+                data['Exemptions'].append(lending_exemption)
+                print(f"Securities lending found: {lending_exemption}")
+        data['Exemptions'] = '; '.join(data['Exemptions']) if data['Exemptions'] else 'None'
+        print(f"N-CEN processed: Fund={data['Fund_Name']}, Retail={data['Is_Retail']}")
+        return pd.DataFrame([data])
+    except Exception as e:
+        print(f"Error parsing N-CEN XML {file_name}: {e}")
+        return pd.DataFrame()
+
+def parse_ncsr_text(text_content, file_name, search_term="GameStop", cusip="36467W109"):
+    """
+    Parse N-CSR text content for specified search term or CUSIP.
+    """
+    print(f"Processing N-CSR text: {file_name}")
+    try:
+        text = text_content.decode('utf-8', errors='ignore')
+        period_match = re.search(r'\b(\d{4}-\d{2}-\d{2})\b', text)
+        period_end = period_match.group(1) if period_match else 'N/A'
+        print(f"Scanning N-CSR for {search_term} or CUSIP {cusip}...")
+        holdings = []
+        swap_pattern = re.compile(
+            r'(?i)(?:swap|derivative)\s+.*?(?:' + re.escape(search_term) + r'|' + re.escape(cusip) + r')\s+.*?counterparty.*?(\w+.*?)\s+(\d+\.?\d*)',
+            re.MULTILINE | re.DOTALL
+        )
+        matches = swap_pattern.findall(text)
+        for counterparty, notional in matches:
+            print(f"Found N-CSR match: Counterparty={counterparty.strip()}, Notional=${notional}")
+            holdings.append({
+                'CIK': file_name.split('/')[-2] if '/' in file_name else 'N/A',
+                'Accession': file_name.replace('.txt', ''),
+                'Period_End': period_end,
+                'Issuer': search_term,
+                'CUSIP': cusip,
+                'Counterparty': counterparty.strip(),
+                'Notional_USD': float(notional.replace(',', '')),
+                'Type': 'Swap (N-CSR)',
+                'Maturity_Date': 'N/A',
+                'Yield': 'N/A'
+            })
+        df = pd.DataFrame(holdings)
+        print(f"N-CSR processed: {len(holdings)} holdings/swaps found")
+        return df
+    except Exception as e:
+        print(f"Error parsing N-CSR {file_name}: {e}")
+        return pd.DataFrame()
+
+def parse_nmfp_xml(xml_content, file_name, search_term="GameStop", cusip="36467W109"):
+    """
+    Parse N-MFP XML content for specified search term or CUSIP.
+    """
+    print(f"Processing N-MFP XML: {file_name}")
+    try:
+        tree = etree.fromstring(xml_content)
+        ns = {'ns': 'http://www.sec.gov/edgar/nmfp'}
+        holdings = []
+        period_end = tree.find('.//ns:periodOfReport', ns).text if tree.find('.//ns:periodOfReport', ns) is not None else 'N/A'
+        cik = tree.find('.//ns:cik', ns).text if tree.find('.//ns:cik', ns) is not None else 'N/A'
+        fund_name = tree.find('.//ns:fundName', ns).text if tree.find('.//ns:fundName', ns) is not None else 'N/A'
+        print(f"Scanning N-MFP for {search_term} or CUSIP {cusip}...")
+        for holding in tree.findall('.//ns:holding', ns):
+            name = holding.find('ns:issuerName', ns).text if holding.find('ns:issuerName', ns) is not None else ''
+            sec_cusip = holding.find('ns:cusip', ns).text if holding.find('ns:cusip', ns) is not None else ''
+            if search_term.lower() in name.lower() or sec_cusip == cusip:
+                print(f"Found N-MFP match: {name} (CUSIP: {sec_cusip})")
+                entry = {
+                    'CIK': cik,
+                    'Accession': file_name.replace('.xml', ''),
+                    'Period_End': period_end,
+                    'Issuer': name,
+                    'CUSIP': sec_cusip,
+                    'Counterparty': 'N/A',
+                    'Notional_USD': float(holding.find('ns:amountInvested/ns:valUSD', ns).text or 0) if holding.find('ns:amountInvested/ns:valUSD', ns) is not None else 0.0,
+                    'Type': 'MMF Holding',
+                    'Maturity_Date': holding.find('ns:maturityDate', ns).text if holding.find('ns:maturityDate', ns) is not None else 'N/A',
+                    'Yield': holding.find('ns:yield', ns).text if holding.find('ns:yield', ns) is not None else 'N/A'
+                }
+                holdings.append(entry)
+        if not holdings:
+            print(f"No holdings matched; adding fund metadata for {fund_name}")
+            holdings.append({
+                'CIK': cik,
+                'Accession': file_name.replace('.xml', ''),
+                'Period_End': period_end,
+                'Issuer': fund_name,
+                'CUSIP': 'N/A',
+                'Counterparty': 'N/A',
+                'Notional_USD': 0.0,
+                'Type': 'MMF Metadata',
+                'Maturity_Date': 'N/A',
+                'Yield': 'N/A'
+            })
+        df = pd.DataFrame(holdings)
+        print(f"N-MFP processed: {len(holdings)} entries (including metadata)")
+        return df
+    except Exception as e:
+        print(f"Error parsing N-MFP XML {file_name}: {e}")
+        return pd.DataFrame()
+
+def unify_nport_ncen(nport_df, ncen_df):
+    """
+    Unify N-PORT and N-CEN DataFrames on CIK and Period_End.
+    """
+    print("Unifying N-PORT and N-CEN data...")
+    if nport_df.empty or ncen_df.empty:
+        print(f"One input is empty: N-PORT rows={len(nport_df)}, N-CEN rows={len(ncen_df)}")
+        return nport_df if not nport_df.empty else ncen_df
+    nport_df['Period_End'] = pd.to_datetime(nport_df['Period_End'], errors='coerce')
+    ncen_df['Period_End'] = pd.to_datetime(ncen_df['Period_End'], errors='coerce')
+    unified = pd.merge(
+        nport_df,
+        ncen_df[['CIK', 'Period_End', 'Fund_Name', 'Is_Retail', 'Exemptions']],
+        on=['CIK', 'Period_End'],
+        how='left'
+    )
+    unified['Fund_Name'] = unified['Fund_Name'].fillna('N/A')
+    unified['Is_Retail'] = unified['Is_Retail'].fillna(False)
+    unified['Exemptions'] = unified['Exemptions'].fillna('None')
+    print(f"Unification complete: {len(unified)} rows")
+    return unified
+
+def correlate_with_ncsr(unified_df, ncsr_df, nmfp_df=None):
+    """
+    Correlate unified DataFrame with N-CSR and N-MFP data.
+    """
+    print("Correlating with N-CSR and N-MFP data...")
+    if nmfp_df is None:
+        nmfp_df = pd.DataFrame()
+    if unified_df.empty:
+        combined = pd.DataFrame()
+        print("Unified DataFrame is empty; starting with empty combined DataFrame")
+    else:
+        combined = unified_df.copy()
+        print(f"Starting with unified DataFrame: {len(combined)} rows")
+    if not ncsr_df.empty:
+        combined = pd.concat([combined, ncsr_df], ignore_index=True)
+        print(f"Appended N-CSR data: {len(ncsr_df)} rows added")
+    if not nmfp_df.empty:
+        for col in ['Fund_Name', 'Is_Retail', 'Exemptions']:
+            nmfp_df[col] = 'N/A' if col == 'Fund_Name' else False if col == 'Is_Retail' else 'None'
+        nmfp_df['Retail_Impact'] = 'Low'
+        combined = pd.concat([combined, nmfp_df], ignore_index=True)
+        print(f"Appended N-MFP data: {len(nmfp_df)} rows added")
+    if not combined.empty:
+        combined['Period_End'] = pd.to_datetime(combined['Period_End'], errors='coerce')
+        combined['Retail_Impact'] = combined.apply(
+            lambda row: 'High' if (row.get('Is_Retail') and (row.get('Notional_USD', 0) > 1e7 or '12d1-4' in str(row.get('Exemptions', '')))) else 'Low',
+            axis=1
+        )
+        print(f"Correlation complete: {len(combined)} total rows")
+    else:
+        print("No data to correlate")
+    return combined
+
+def export_to_csv(df, output_path):
+    """
+    Export the final DataFrame to CSV.
+    """
+    print(f"Exporting to {output_path}...")
+    df.to_csv(output_path, index=False)
+    print(f"Export complete: {len(df)} rows written")
+
+def process_zip_files(source_dir, extension, parse_func, search_term, cusip, is_text=False):
+    """
+    Generic ZIP processor for all archive types.
+    """
+    dfs = []
+    if os.path.exists(source_dir):
+        zip_files = [f for f in os.listdir(source_dir) if f.endswith('.zip')]
+        print(f"Found {len(zip_files)} ZIP files in {source_dir}")
+        for zip_file in tqdm(zip_files, desc=f"Processing ZIPs in {os.path.basename(source_dir)}"):
+            zip_path = os.path.join(source_dir, zip_file)
+            print(f"Extracting ZIP: {zip_path}")
+            with zipfile.ZipFile(zip_path, 'r') as zf:
+                inner_files = [f for f in zf.namelist() if f.endswith(extension)]
+                print(f"Found {len(inner_files)} {extension} files in {zip_file}")
+                for inner_file in tqdm(inner_files, desc=f"Processing {extension}s in {zip_file}", leave=False):
+                    with zf.open(inner_file) as f:
+                        content = f.read()
+                        df = parse_func(content, inner_file, search_term, cusip)
+                        if not df.empty:
+                            dfs.append(df)
+    else:
+        print(f"Directory not found: {source_dir}")
+    return dfs
+
+def parse_all_filings(search_term="GameStop", cusip="36467W109"):
+    """
+    Chain parsing of ZIP archives for N-PORT, N-CSR, N-CEN, N-MFP.
+    """
+    print("Starting SEC filings processing...")
+    try:
+        nport_dfs = process_zip_files(NPORT_SOURCE_DIR, '.xml', parse_nport_xml, search_term, cusip)
+        ncsr_dfs = process_zip_files(NCSR_DIR, '.txt', parse_ncsr_text, search_term, cusip, is_text=True)
+        ncen_dfs = process_zip_files(NCEN_SOURCE_DIR, '.xml', parse_ncen_xml, search_term, cusip)
+        nmfp_dfs = process_zip_files(NMFP_SOURCE_DIR, '.xml', parse_nmfp_xml, search_term, cusip)
+
+        nport_df = pd.concat(nport_dfs, ignore_index=True) if nport_dfs else pd.DataFrame()
+        print(f"Combined N-PORT: {len(nport_df)} rows")
+        ncsr_df = pd.concat(ncsr_dfs, ignore_index=True) if ncsr_dfs else pd.DataFrame()
+        print(f"Combined N-CSR: {len(ncsr_df)} rows")
+        ncen_df = pd.concat(ncen_dfs, ignore_index=True) if ncen_dfs else pd.DataFrame()
+        print(f"Combined N-CEN: {len(ncen_df)} rows")
+        nmfp_df = pd.concat(nmfp_dfs, ignore_index=True) if nmfp_dfs else pd.DataFrame()
+        print(f"Combined N-MFP: {len(nmfp_df)} rows")
+
+        unified_df = unify_nport_ncen(nport_df, ncen_df)
+        final_df = correlate_with_ncsr(unified_df, ncsr_df, nmfp_df)
+
+        output_file = f'{search_term}_swaps_unified_{datetime.now().strftime("%Y%m%d")}.csv'
+        export_to_csv(final_df, output_file)
+        print("Processing complete!")
+        return final_df
+    except Exception as e:
+        print(f"Error in parse_all_filings: {e}")
+        return pd.DataFrame()
+def edgartotal():
+    from ratelimit import limits, sleep_and_retry
+    import backoff, multiprocessing
+    # Define EDGAR_SOURCE_DIR before running
+    # EDGAR_SOURCE_DIR = "path/to/zip/files"  # Uncomment and set your directory
+    file_queue = Queue()
+    idx_file = os.path.join(EDGAR_SOURCE_DIR, "master.idx")
+    log_file = os.path.join(EDGAR_SOURCE_DIR, "sec_download_log.txt")
+    
+    # Configure logging
+    logging.basicConfig(
+        level=logging.ERROR,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        filename='error_log.txt',
+        filemode='w'
+    )
+    logging.error("This is an error message")
+
+    # Track total file size across all URLs
+    total_size_all = 0
+    log_buffer = []  # Buffer for log messages
+
+    def flush_log_buffer():
+        if log_buffer:
+            with open(log_file, 'a') as log:
+                log.writelines(log_buffer)
+            log_buffer.clear()
+
+    def log_progress(message):
+        nonlocal log_buffer
+        timestamp = datetime.now()
+        entry = f"{timestamp}: {message}\n"
+        log_buffer.append(entry)
+        if len(log_buffer) >= 1000:  # Flush buffer every 1000 lines
+            flush_log_buffer()
+        if "Progress" in message or "Finished" in message or "Total" in message or "Error" in message or "429" in message:
+            print(message)
+
+    def get_dynamic_workers(failed_429_count=0):
+        """Calculate the number of ThreadPoolExecutor workers based on CPU threads and 429 errors."""
+        cpu_count = multiprocessing.cpu_count()
+        base_workers = min(cpu_count * 2, 16)
+        # Reduce workers if 429 errors are frequent
+        if failed_429_count > 10:  # Adjust threshold based on testing
+            max_workers = max(base_workers // 2, 1)  # Halve workers, minimum 1
+            log_progress(f"High 429 errors ({failed_429_count}). Reducing workers to {max_workers}")
+        else:
+            max_workers = base_workers
+        log_progress(f"Detected {cpu_count} CPU threads. Setting ThreadPoolExecutor workers to {max_workers}")
+        return max_workers
+
+    @sleep_and_retry
+    @limits(calls=10, period=60)  # Limit to 10 requests per minute
+    @backoff.on_exception(backoff.expo, requests.exceptions.HTTPError, max_tries=3)
+    def check_file_size(url):
+        nonlocal total_size_all
+        try:
+            headers = {'User-Agent': "FORTHELULZ@anonops.com"}
+            response = requests.head(url, headers=headers, timeout=10)
+            response.raise_for_status()
+            size = int(response.headers.get('Content-Length', 0))
+            log_progress(f"Size retrieved for {url}: {size} bytes")
+            total_size_all += size
+            return size
+        except requests.exceptions.HTTPError as e:
+            if e.response.status_code == 429:
+                retry_after = e.response.headers.get('Retry-After')
+                log_progress(f"429 Error for {url}: Too Many Requests. Retry-After: {retry_after if retry_after else 'Not provided'}")
+            else:
+                log_progress(f"Failed to get size for {url}: {e}")
+            return None
+        except requests.RequestException as e:
+            log_progress(f"Failed to get size for {url}: {e}")
+            return None
+
+    def process_line(line):
+        parts = line.split('|')
+        if len(parts) >= 5:
+            filename = parts[4].strip()
+            if filename.endswith("Filename"):
+                filename = filename.rsplit('/', 1)[0]
+            url = f"https://www.sec.gov/Archives/{filename}"
+            return url
+        return None
+
+    def extract_idx_from_zip(zip_path):
+        try:
+            with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+                for file_name in zip_ref.namelist():
+                    if file_name.endswith('.idx'):
+                        idx_content = zip_ref.read(file_name).decode('utf-8', errors='ignore')
+                        return '\n'.join(idx_content.split('\n')[12:])
+            log_progress(f"Warning: No IDX file found in {zip_path}, skipping.")
+            return None
+        except Exception as e:
+            log_progress(f"Error reading {zip_path}: {e}")
+            return None
+
+    def get_user_selection(zip_files):
+        print("\nEnter a 4-digit year, 'qtr' for specific quarter, 'all' for all archives, or '0' to return to main menu:")
+        while True:
+            choice = input("Your choice: ").strip().lower()
+            if choice == '0':
+                return None
+            elif choice == 'all':
+                return zip_files
+            elif choice == 'qtr':
+                print("\nAvailable ZIP files:")
+                for i, file in enumerate(zip_files, 1):
+                    print(f"{i}. {file}")
+                while True:
+                    try:
+                        choice = int(input("Enter the number of the ZIP file to process (or 0 to exit): "))
+                        if choice == 0:
+                            break
+                        if 1 <= choice <= len(zip_files):
+                            return [zip_files[choice - 1]]
+                        print("Invalid choice. Please enter a number between 1 and", len(zip_files))
+                    except ValueError:
+                        print("Please enter a valid number.")
+            elif choice.isdigit() and len(choice) == 4:
+                year = choice
+                print(f"Processing files for year {year}. Enter a quarter (1-4) or press Enter for all quarters:")
+                quarter = input("Quarter (or press Enter for all): ").strip()
+                if quarter and quarter.isdigit() and 1 <= int(quarter) <= 4:
+                    year_files = [f for f in zip_files if f.startswith(year) and f.endswith(f"_QTR{quarter}.zip")]
+                else:
+                    year_files = [f for f in zip_files if f.startswith(year)]
+                if year_files:
+                    print(f"Processing files for year {year}, quarter {quarter if quarter else 'all'}:")
+                    return year_files
+                print(f"No files found for year {year}, quarter {quarter if quarter else 'all'}.")
+            else:
+                print("Only 4-digit year, 'qtr', 'all', or '0' accepted. For example: 1999, qtr, all")
+
+    def process_zip(zip_path, failed_429_count=0):
+        log_progress(f"Processing {zip_path}")
+        idx_content = extract_idx_from_zip(zip_path)
+        if not idx_content:
+            return 0, 0
+        urls = [process_line(line) for line in idx_content.split('\n') if process_line(line)]
+    
+        checked = 0
+        failed = 0
+        failed_429 = 0
+        total_files = len(urls)
+        zip_total_size = 0
+        failed_urls = []
+    
+        with ThreadPoolExecutor(max_workers=get_dynamic_workers(failed_429_count)) as executor:
+            futures = {executor.submit(check_file_size, url): url for url in urls}
+            for future in tqdm(concurrent.futures.as_completed(futures), total=total_files, desc=f"Processing {os.path.basename(zip_path)}"):
+                url = futures[future]
+                size = future.result()
+                if size is not None:
+                    checked += 1
+                    zip_total_size += size
+                else:
+                    failed += 1
+                    if "429" in str(future.exception()):
+                        failed_429 += 1
+                        failed_urls.append(url)
+                log_progress(f"Progress: Checked {checked}/{total_files}, Failed {failed}, 429 Errors {failed_429}")
+
+        log_progress(f"Finished processing {zip_path}. Checked {checked}/{total_files}, Failed {failed}, 429 Errors {failed_429}, Total Size: {zip_total_size} bytes")
+        if failed_urls:
+            log_progress(f"Failed URLs due to 429: {len(failed_urls)}. Consider retrying these URLs after a delay.")
+        flush_log_buffer()
+        return zip_total_size, failed_429
+
+    def remove_top_lines(file_path, lines_to_remove=11):
+        with open(file_path, 'r') as file:
+            lines = file.readlines()
+        with open(file_path, 'w') as file:
+            file.writelines(lines[lines_to_remove:])
+
+    def compile_urls(zip_directory, idx_file):
+        log_progress(f"Starting URL compilation from {zip_directory} into {idx_file}")
+        total_zips = len([f for f in os.listdir(zip_directory) if f.endswith('.zip')])
+        with tqdm(total=total_zips, desc="Compiling URLs") as pbar:
+            for file in os.listdir(zip_directory):
+                if file.endswith('.zip'):
+                    zip_path = os.path.join(zip_directory, file)
+                    idx_content = extract_idx_from_zip(zip_path)
+                    if idx_content:
+                        try:
+                            with open(idx_file, 'a', encoding='utf-8') as master_file:
+                                for line in idx_content.split('\n'):
+                                    if line.strip():
+                                        master_file.write(line + '\n')
+                            log_progress(f"Processed ZIP file: {file}")
+                        except Exception as e:
+                            log_progress(f"Error writing to {idx_file} from {file}: {e}")
+                    pbar.update(1)
+        log_progress(f"URL compilation completed. Processed {total_zips} ZIP files")
+        flush_log_buffer()
+
+    def scrape_sec(idx_file, failed_429_count=0):
+        log_progress(f"Starting SEC size checking from {idx_file}")
+        with open(idx_file, 'r', encoding='utf-8', errors='ignore') as file:
+            lines = file.readlines()
+        
+        urls = [process_line(line) for line in lines if process_line(line) is not None]
+        total_urls = len(urls)
+        log_progress(f"Found {total_urls} URLs to check")
+
+        failed_urls = []
+        failed_429 = 0
+        sec_total_size = 0
+        checked = 0
+
+        with ThreadPoolExecutor(max_workers=get_dynamic_workers(failed_429_count)) as executor:
+            with tqdm(total=total_urls, desc="Checking SEC sizes") as pbar:
+                future_to_url = {executor.submit(check_file_size, url): url for url in urls}
+                for future in concurrent.futures.as_completed(future_to_url):
+                    url = future_to_url[future]
+                    size = future.result()
+                    if size is not None:
+                        sec_total_size += size
+                        checked += 1
+                    else:
+                        failed_urls.append(url)
+                        if "429" in str(future.exception()):
+                            failed_429 += 1
+                    log_progress(f"Progress: Checking {url} {'successfully' if size is not None else 'with errors'}")
+                    pbar.update(1)
+
+        log_progress(f"Checked {checked} file sizes successfully, Failed {len(failed_urls)}, 429 Errors {failed_429}, Total Size: {sec_total_size} bytes")
+        if failed_urls:
+            log_progress(f"Failed URLs due to 429: {len(failed_urls)}. Consider retrying these URLs after a delay.")
+        flush_log_buffer()
+        return sec_total_size, failed_429
+
+    try:
+        with open(idx_file, 'w') as master_file:
+            master_file.write("")
+
+        zip_files = [f for f in os.listdir(EDGAR_SOURCE_DIR) if f.endswith('.zip')]
+
+        total_files_all = 0
+        zip_total_sizes = 0
+        total_failed_429 = 0
+
+        while True:
+            selected_zips = get_user_selection(zip_files)
+            if not selected_zips and zip_files:
+                selected_zips = zip_files
+            if not selected_zips:
+                break
+        
+            total_files = sum(len([process_line(line) for line in extract_idx_from_zip(os.path.join(EDGAR_SOURCE_DIR, zip)).split('\n') if process_line(line)]) for zip in selected_zips)
+            log_progress(f"Total files to check across {len(selected_zips)} ZIPs: {total_files}")
+            total_files_all += total_files
+        
+            for zip_file in selected_zips:
+                zip_path = os.path.join(EDGAR_SOURCE_DIR, zip_file)
+                zip_total_size, failed_429 = process_zip(zip_path, total_failed_429)
+                zip_total_sizes += zip_total_size
+                total_failed_429 += failed_429
+
+        log_progress(f"SEC size checking pipeline completed. Total files checked across all ZIPs: {total_files_all}, Total Size: {zip_total_sizes} bytes, Total 429 Errors: {total_failed_429}")
+
+    except Exception as e:
+        log_progress(f"An error occurred: {e}")
+
+    try:
+        with open(idx_file, 'w') as master_file:
+            master_file.write("")
+
+        zip_files = [f for f in os.listdir(EDGAR_SOURCE_DIR) if f.endswith('.zip')]
+        total_failed_429 = 0
+
+        for zip_file in zip_files:
+            zip_path = os.path.join(EDGAR_SOURCE_DIR, zip_file)
+            try:
+                log_progress(f"Processing ZIP file: {zip_file}")
+                idx_file_path = extract_idx_from_zip(zip_path)
+                if idx_file_path:
+                    remove_top_lines(idx_file_path)
+                    with open(idx_file_path, 'r') as f:
+                        content = f.read()
+                    file_queue.put(content)
+                    os.remove(idx_file_path)
+                log_progress(f"Successfully processed ZIP file: {zip_file}")
+            except Exception as e:
+                log_progress(f"Error processing {zip_file}: {e}")
+
+            def write_to_master_file():
+                while not file_queue.empty():
+                    content = file_queue.get()
+                    with open(idx_file, 'a') as master_file:
+                        for line in content.split('\n'):
+                            if line.strip():
+                                master_file.write(line + '\n')
+
+            write_to_master_file()
+
+        log_progress("Compilation complete! uwu")
+
+        log_progress("Starting to compile URLs from ZIP files...")
+        start_time = time.time()
+        compile_urls(EDGAR_SOURCE_DIR, idx_file)
+        end_time = time.time()
+        log_progress(f"URL compilation completed in {end_time - start_time:.2f} seconds")
+
+        log_progress("Starting to check SEC file sizes...")
+        start_time = time.time()
+        sec_total_size, failed_429 = scrape_sec(idx_file, total_failed_429)
+        total_failed_429 += failed_429
+        end_time = time.time()
+        log_progress(f"SEC size checking completed in {end_time - start_time:.2f} seconds")
+        log_progress(f"Final Total Size for all URLs: {total_size_all} bytes, Total 429 Errors: {total_failed_429}")
+        flush_log_buffer()
+
+    except Exception as e:
+        log_progress(f"An error occurred: {e}")
+def count():
+    from collections import defaultdict
+    import os
+    import glob
+    from zipfile import ZipFile
+    import pandas as pd
+    import logging
+    from datetime import datetime
+    import gc
+
+    gamecat_ascii()
+
+    # Set up logging
+    log_file = os.path.join(EQUITY_SOURCE_DIR, 'count_process.log')
+    logging.basicConfig(
+        filename=log_file,
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s'
+    )
+
+    def parse_zips(search_term=None):
+        from collections import defaultdict
+        import os
+        import glob
+        from zipfile import ZipFile
+        import pandas as pd
+        import logging
+        from datetime import datetime
+        import gc
+
+        # Set up logging
+        log_file = os.path.join(EQUITY_SOURCE_DIR, 'count_process.log')
+        logging.basicConfig(
+            filename=log_file,
+            level=logging.INFO,
+            format='%(asctime)s - %(levelname)s - %(message)s'
+        )
+
+        # Initialize output CSV with headers
+        master_csv_path = os.path.join(EQUITY_SOURCE_DIR, 'date_notional_summary_by_all_currencies.csv')
+        known_currencies = {'EUR', 'USD', 'JPY', 'CAD', 'AUD', 'CHF'}
+        all_currencies = set(known_currencies)  # Will grow with unknown currencies
+
+        # Define headers based on search term
+        is_perpetual = search_term == '9999-12-31'
+        if is_perpetual:
+            initial_columns = ['Count', 'NEWT', 'MODI', 'Date'] + sorted(list(all_currencies))
+        else:
+            initial_columns = ['Count', 'Date'] + sorted(list(all_currencies))
+        
+        # Initialize CSV
+        pd.DataFrame(columns=initial_columns).to_csv(master_csv_path, index=False, mode='w')
+        logging.info(f"Initialized CSV with {len(initial_columns)} headers: {master_csv_path}")
+
+        # Get and sort ZIP files
+        zip_files = sorted(glob.glob(os.path.join(EQUITY_SOURCE_DIR, '*.zip')), key=lambda x: os.path.basename(x))
+        total_files = len(zip_files)
+        files_processed = 0
+
+        # Load processed files from log to skip them if resuming
+        processed_files = set()
+        if os.path.exists(log_file):
+            with open(log_file, 'r') as f:
+                for line in f:
+                    if 'Successfully processed' in line:
+                        file_path = line.split('Successfully processed ')[-1].split(' at')[0].strip()
+                        processed_files.add(os.path.normpath(file_path))
+
+        print(f"\nStarting to process {total_files} zip files...")
+        logging.info(f"Starting to process {total_files} zip files")
+
+        for index, zip_file in enumerate(zip_files, 1):
+            zip_file = os.path.normpath(zip_file)
+            if zip_file in processed_files:
+                print(f"Skipping already processed file {index}/{total_files}: {zip_file}")
+                logging.info(f"Skipped already processed file: {zip_file}")
+                continue
+
+            print(f"\nProcessing file {index}/{total_files}: {zip_file}")
+            logging.info(f"Processing file: {zip_file}")
+
+            # Initialize aggregates for this file
+            date_aggregates = {}
+            try:
+                with ZipFile(zip_file, 'r') as zip_ref:
+                    csv_filename = zip_ref.namelist()[0]  # Assuming one CSV per zip
+                    print(f"Reading CSV file: {csv_filename}")
+                    logging.info(f"Reading CSV file: {csv_filename}")
+                    with zip_ref.open(csv_filename) as csv_file:
+                        df = pd.read_csv(csv_file, low_memory=False)
+                        # Check if required columns exist (C:2, L:11, M:12, T:19, V:21)
+                        if len(df.columns) <= 21:  # Need at least 22 columns
+                            print(f"Warning: {zip_file} has fewer than 22 columns. Skipping.")
+                            logging.warning(f"{zip_file} has fewer than 22 columns. Skipping.")
+                            continue
+                        column_c = df.iloc[:, 2]   # Column C (TYPE: NEWT, MODI, etc.)
+                        column_l = df.iloc[:, 11]  # Column L (effective dates)
+                        column_m = df.iloc[:, 12]  # Column M (expiry dates)
+                        column_t = df.iloc[:, 19]  # Column T (notional amounts)
+                        column_v = df.iloc[:, 21]  # Column V (currency type)
+
+                        # Convert notional amounts to numeric
+                        column_t_numeric = pd.to_numeric(column_t, errors='coerce')
+                        if column_t_numeric.isna().all():
+                            print(f"Warning: No valid numeric values in column T of {zip_file}. Skipping.")
+                            logging.warning(f"No valid numeric values in column T of {zip_file}. Skipping.")
+                            continue
+
+                        if is_perpetual:
+                            # Filter for perpetual swaps (Column M == '9999-12-31')
+                            perpetual_mask = column_m == '9999-12-31'
+                            df_perpetual = df[perpetual_mask]
+                            if df_perpetual.empty:
+                                print(f"No perpetual swaps found in {zip_file}. Skipping.")
+                                logging.info(f"No perpetual swaps found in {zip_file}.")
+                                continue
+                            
+                            # Aggregate by expiry date (Column M)
+                            for date, type_val, notional, currency in zip(
+                                df_perpetual.iloc[:, 12],  # Column M
+                                df_perpetual.iloc[:, 2],   # Column C
+                                pd.to_numeric(df_perpetual.iloc[:, 19], errors='coerce'),  # Column T
+                                df_perpetual.iloc[:, 21]   # Column V
+                            ):
+                                if pd.notna(date) and isinstance(date, str) and len(date) == 10:
+                                    try:
+                                        datetime.strptime(date, '%Y-%m-%d')  # Validate date
+                                        if date not in date_aggregates:
+                                            date_aggregates[date] = {
+                                                'count': 0,
+                                                'newt': 0,
+                                                'modi': 0,
+                                                'notional': defaultdict(float)
+                                            }
+                                        date_aggregates[date]['count'] += 1
+                                        if type_val == 'NEWT':
+                                            date_aggregates[date]['newt'] += 1
+                                        elif type_val == 'MODI':
+                                            date_aggregates[date]['modi'] += 1
+                                        if pd.notna(notional):
+                                            currency = str(currency).strip().upper()
+                                            date_aggregates[date]['notional'][currency] += notional
+                                            all_currencies.add(currency)
+                                    except ValueError:
+                                        print(f"Warning: Invalid date format in {zip_file} for value {date}. Skipping.")
+                                        logging.warning(f"Invalid date format in {zip_file} for value {date}. Skipping.")
+                                else:
+                                    print(f"Warning: Skipping invalid date {date} in {zip_file}.")
+                                    logging.warning(f"Skipping invalid date {date} in {zip_file}.")
+                        else:
+                            # Default mode: Aggregate by expiry date (Column M)
+                            for date, notional, currency in zip(column_m, column_t_numeric, column_v):
+                                if pd.notna(date) and isinstance(date, str) and len(date) == 10:
+                                    try:
+                                        datetime.strptime(date, '%Y-%m-%d')
+                                        if date not in date_aggregates:
+                                            date_aggregates[date] = {
+                                                'count': 0,
+                                                'notional': defaultdict(float)
+                                            }
+                                        date_aggregates[date]['count'] += 1
+                                        if pd.notna(notional):
+                                            currency = str(currency).strip().upper()
+                                            date_aggregates[date]['notional'][currency] += notional
+                                            all_currencies.add(currency)
+                                    except ValueError:
+                                        print(f"Warning: Invalid date format in {zip_file} for value {date}. Skipping.")
+                                        logging.warning(f"Invalid date format in {zip_file} for value {date}. Skipping.")
+                                else:
+                                    print(f"Warning: Skipping invalid date {date} in {zip_file}.")
+                                    logging.warning(f"Skipping invalid date {date} in {zip_file}.")
+
+                    # Convert aggregates to DataFrame for this file
+                    if date_aggregates:
+                        result_data = []
+                        current_columns = ['Count', 'NEWT', 'MODI', 'Date'] if is_perpetual else ['Count', 'Date']
+                        current_columns += sorted(list(all_currencies))
+                        for date, data in date_aggregates.items():
+                            row = {'Date': date, 'Count': data['count']}
+                            if is_perpetual:
+                                row['NEWT'] = data['newt']
+                                row['MODI'] = data['modi']
+                            # Fill all known currencies with 0 if not present
+                            for currency in all_currencies:
+                                row[currency] = data['notional'].get(currency, 0)
+                            result_data.append(row)
+                        result_df = pd.DataFrame(result_data, columns=current_columns)
+
+                        # Append to CSV with updated header if new currencies are detected
+                        if os.path.exists(master_csv_path):
+                            existing_df = pd.read_csv(master_csv_path, nrows=0)
+                            existing_columns = set(existing_df.columns)
+                            new_columns = set(current_columns) - existing_columns
+                            if new_columns:
+                                logging.info(f"Detected new currencies: {new_columns}. Updating CSV header.")
+                                # Append new columns with 0 to existing data
+                                with open(master_csv_path, 'a') as f:
+                                    for _ in range(len(existing_df.index)):
+                                        f.write(',' + ','.join(['0'] * len(new_columns)) + '\n')
+                                # Rewrite header with all columns
+                                result_df.to_csv(master_csv_path, index=False, mode='w')
+                            else:
+                                result_df.to_csv(master_csv_path, index=False, header=False, mode='a')
+                        else:
+                            result_df.to_csv(master_csv_path, index=False, mode='w')
+
+                        print(f"Appended results for {zip_file} to {master_csv_path}")
+                        logging.info(f"Appended results for {zip_file} to {master_csv_path}")
+
+                        # Log number of unique dates before clearing
+                        num_dates = len(date_aggregates)
+                        # Clear memory
+                        del result_df
+                        del date_aggregates
+                        gc.collect()
+                    else:
+                        num_dates = 0
+                        logging.info(f"No valid data aggregated for {zip_file}.")
+
+                    files_processed += 1
+                    print(f"Processed {zip_file}. Current aggregates: {num_dates} unique dates.")
+                    logging.info(f"Successfully processed {zip_file} at {datetime.now()}")
+            except Exception as e:
+                logging.error(f"Error processing {zip_file}: {e}")
+                print(f"Error occurred while processing {zip_file}. Continuing to next file.")
+
+        print(f"\nProcessing complete. Total files processed: {files_processed}/{total_files}")
+        logging.info(f"Processing complete. Total files processed: {files_processed}/{total_files}")
+
+        # Load final CSV to compute totals
+        if files_processed > 0:
+            final_df = pd.read_csv(master_csv_path, on_bad_lines='skip', encoding='utf-8')
+            if not final_df.empty:
+                total_count = final_df['Count'].sum()
+                total_notional_by_currency = {c: final_df[c].sum() for c in all_currencies if c in final_df.columns}
+                print(f"Total count of dates: {total_count}")
+                if is_perpetual:
+                    total_newt = final_df['NEWT'].sum() if 'NEWT' in final_df.columns else 0
+                    total_modi = final_df['MODI'].sum() if 'MODI' in final_df.columns else 0
+                    print(f"Total NEWT count: {total_newt}")
+                    print(f"Total MODI count: {total_modi}")
+                for currency, total in total_notional_by_currency.items():
+                    print(f"Total {currency} notional: {total:.2f}")
+                logging.info(f"Column M count and Notional T sum by currency completed. Total count: {total_count}")
+            else:
+                print("No valid data found.")
+                logging.info("No valid data found for aggregation.")
+            return final_df
+        else:
+            print("No valid data found.")
+            logging.info("No valid data found for aggregation.")
+            return pd.DataFrame(columns=initial_columns)
+
+    print("Enter a date to filter (e.g., 2023-01-01) or 9999-12-31 for perpetual swaps, or 'q' to quit:")
+    user_input = input().strip()
+    if user_input.lower() != 'q':
+        search_term = user_input if user_input else None
+        result_df = parse_zips(search_term=search_term)
+        if not result_df.empty:
+            master_csv_path = os.path.join(EQUITY_SOURCE_DIR, 'date_notional_summary_by_all_currencies.csv')
+            print(f"\nSaving results to: {master_csv_path}")
+            if search_term == '9999-12-31':
+                print(f"CSV columns: A (Count), B (NEWT), C (MODI), D (Date), followed by columns for each currency (e.g., E (AUD), F (CAD), ...)")
+            else:
+                print(f"CSV columns: A (Count), B (Date), followed by columns for each currency (e.g., C (AUD), D (CAD), ...)")
+        else:
+            print("No data to save.")
+    else:
+        print("Exiting script.")
+
+def count2():
+    from collections import defaultdict
+
+    gamecat_ascii()
+
+    # Set up logging
+    log_file = os.path.join(EQUITY_SOURCE_DIR, 'count2_process.log')
+    logging.basicConfig(
+        filename=log_file,
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s'
+    )
+
+    def parse_zips():
+        from collections import defaultdict 
+
+        # Set up logging
+        log_file = os.path.join(EQUITY_SOURCE_DIR, 'count2_process.log')
+        logging.basicConfig(
+            filename=log_file,
+            level=logging.INFO,
+            format='%(asctime)s - %(levelname)s - %(message)s'
+        )
+
+        # Initialize output CSV with headers
+        master_csv_path = os.path.join(EQUITY_SOURCE_DIR, 'date_notional_summary_by_all_currencies_count2.csv')
+        known_currencies = {'EUR', 'USD', 'JPY', 'CAD', 'AUD', 'CHF'}
+        all_currencies = set(known_currencies)  # Will grow with unknown currencies
+
+        # Define headers
+        initial_columns = ['Count', 'Date'] + sorted(list(all_currencies))
+        
+        # Initialize CSV if it doesn't exist
+        if not os.path.exists(master_csv_path):
+            pd.DataFrame(columns=initial_columns).to_csv(master_csv_path, index=False, mode='w')
+            logging.info(f"Initialized new CSV with {len(initial_columns)} headers: {master_csv_path}")
+        else:
+            logging.info(f"Using existing CSV: {master_csv_path}")
+
+        # Get and sort ZIP files
+        zip_files = sorted(glob.glob(os.path.join(EQUITY_SOURCE_DIR, '*.zip')), key=lambda x: os.path.basename(x))
+        total_files = len(zip_files)
+        files_processed = 0
+
+        # Load processed files from log to skip them if resuming
+        processed_files = set()
+        if os.path.exists(log_file):
+            with open(log_file, 'r') as f:
+                for line in f:
+                    if 'Successfully processed' in line:
+                        file_path = line.split('Successfully processed ')[-1].split(' at')[0].strip()
+                        processed_files.add(os.path.normpath(file_path))
+
+        print(f"\nStarting to process {total_files} zip files...")
+        logging.info(f"Starting to process {total_files} zip files")
+
+        for index, zip_file in enumerate(zip_files, 1):
+            zip_file = os.path.normpath(zip_file)
+            if zip_file in processed_files:
+                print(f"Skipping already processed file {index}/{total_files}: {zip_file}")
+                logging.info(f"Skipped already processed file: {zip_file}")
+                continue
+
+            print(f"\nProcessing file {index}/{total_files}: {zip_file}")
+            logging.info(f"Processing file: {zip_file}")
+
+            # Initialize aggregates for this file
+            date_aggregates = defaultdict(lambda: {'count': 0, 'notional': defaultdict(float)})
+            try:
+                with ZipFile(zip_file, 'r') as zip_ref:
+                    csv_filename = zip_ref.namelist()[0]  # Assuming one CSV per zip
+                    print(f"Reading CSV file: {csv_filename}")
+                    logging.info(f"Reading CSV file: {csv_filename}")
+                    with zip_ref.open(csv_filename) as csv_file:
+                        df = pd.read_csv(csv_file, low_memory=False)
+                        # Check if required columns exist (L:11, T:19, V:21)
+                        if len(df.columns) <= 21:  # Need at least 22 columns
+                            print(f"Warning: {zip_file} has fewer than 22 columns. Skipping.")
+                            logging.warning(f"{zip_file} has fewer than 22 columns. Skipping.")
+                            continue
+                        column_l = df.iloc[:, 11]  # Column L (effective dates)
+                        column_t = df.iloc[:, 19]  # Column T (notional amounts)
+                        column_v = df.iloc[:, 21]  # Column V (currency type)
+
+                        # Convert notional amounts to numeric
+                        column_t_numeric = pd.to_numeric(column_t, errors='coerce')
+                        if column_t_numeric.isna().all():
+                            print(f"Warning: No valid numeric values in column T of {zip_file}. Skipping.")
+                            logging.warning(f"No valid numeric values in column T of {zip_file}. Skipping.")
+                            continue
+
+                        # Aggregate by effective date (Column L) for this file
+                        for date, notional, currency in zip(column_l, column_t_numeric, column_v):
+                            if pd.notna(date) and isinstance(date, str) and len(date) == 10:
+                                try:
+                                    datetime.strptime(date, '%Y-%m-%d')
+                                    date_aggregates[date]['count'] += 1
+                                    if pd.notna(notional):
+                                        currency = str(currency).strip().upper()
+                                        date_aggregates[date]['notional'][currency] += notional
+                                        all_currencies.add(currency)
+                                except ValueError:
+                                    print(f"Warning: Invalid date format in {zip_file} for value {date}. Skipping.")
+                                    logging.warning(f"Invalid date format in {zip_file} for value {date}. Skipping.")
+                            else:
+                                print(f"Warning: Skipping invalid date {date} in {zip_file}.")
+                                logging.warning(f"Skipping invalid date {date} in {zip_file}.")
+
+                # Convert aggregates to DataFrame for this file
+                if date_aggregates:
+                    result_data = []
+                    for date, data in date_aggregates.items():
+                        row = {'Date': date, 'Count': data['count']}
+                        for currency in all_currencies:
+                            row[currency] = data['notional'].get(currency, 0)
+                        result_data.append(row)
+                    new_df = pd.DataFrame(result_data, columns=initial_columns)
+
+                    # Load existing data and append new data
+                    if os.path.exists(master_csv_path):
+                        existing_df = pd.read_csv(master_csv_path, on_bad_lines='skip', encoding='utf-8')
+                        if not existing_df.empty:
+                            combined_df = pd.concat([existing_df, new_df]).drop_duplicates(subset=['Date'], keep='first')
+                        else:
+                            combined_df = new_df
+                    else:
+                        combined_df = new_df
+
+                    # Write combined data back to CSV
+                    combined_df.to_csv(master_csv_path, index=False, mode='w')
+                    print(f"Appended results for {zip_file} to: {master_csv_path}")
+                    logging.info(f"Appended results for {zip_file} to: {master_csv_path}")
+
+                    # Log number of unique dates before clearing
+                    num_dates = len(date_aggregates)
+                    # Clear memory
+                    del date_aggregates
+                    del new_df
+                    del combined_df
+                    gc.collect()
+                else:
+                    num_dates = 0
+                    logging.info(f"No valid data aggregated for {zip_file}.")
+
+                files_processed += 1
+                print(f"Processed {zip_file}. Current aggregates: {num_dates} unique dates.")
+                logging.info(f"Successfully processed {zip_file} at {datetime.now()}")
+            except Exception as e:
+                logging.error(f"Error processing {zip_file}: {e}")
+                print(f"Error occurred while processing {zip_file}. Continuing to next file.")
+
+        print(f"\nProcessing complete. Total files processed: {files_processed}/{total_files}")
+        logging.info(f"Processing complete. Total files processed: {files_processed}/{total_files}")
+
+        # Load final CSV to compute totals
+        if files_processed > 0:
+            final_df = pd.read_csv(master_csv_path, on_bad_lines='skip', encoding='utf-8')
+            if not final_df.empty:
+                total_count = final_df['Count'].sum()
+                total_notional_by_currency = {c: final_df[c].sum() for c in all_currencies if c in final_df.columns}
+                print(f"Total count of dates: {total_count}")
+                for currency, total in total_notional_by_currency.items():
+                    print(f"Total {currency} notional: {total:.2f}")
+                logging.info(f"Column L count and Notional T sum by currency completed. Total count: {total_count}")
+            else:
+                print("No valid data found.")
+                logging.info("No valid data found for aggregation.")
+            return final_df
+        else:
+            print("No valid data found.")
+            logging.info("No valid data found for aggregation.")
+            return pd.DataFrame(columns=initial_columns)
+
+    # Start processing immediately
+    result_df = parse_zips()
+    if not result_df.empty:
+        master_csv_path = os.path.join(EQUITY_SOURCE_DIR, 'date_notional_summary_by_all_currencies_count2.csv')
+        print(f"\nSaving results to: {master_csv_path}")
+        print(f"CSV columns: A (Count), B (Date), followed by columns for each currency (e.g., C (AUD), D (CAD), ...)")
+    else:
+        print("No data to save.")
 if __name__ == "__main__":
     check_and_install_modules()
     import_modules()
@@ -4281,27 +5542,45 @@ if __name__ == "__main__":
     print("m: CFTC Credit Swap archives")
     print("m2: CFTC Equity Swap archives")
     print("m3: CFTC Commodity Swap archives")
+    print("m4: CFTC Foreign Exchange Swap archives")
+    print("m5: CFTC Interest Rate Swap archives")
     print("e: Edgar archives")
     print("r: Exchange volume archives")
     print("i: Insider trading archives")
     print("c: Codex Of Instruments")
     print("a: Allyourbasearebelongtous- scrape every edgar filing ever.")
+    print("n: create an N-CSR archive from edgar indexes")
 
     query = input("Enter the number corresponding to your choice: ").strip()
     if query.isdigit() and len(query) == 7:
         process_cik(query)  # Call it directly
+    if query == 'chain':
+        # Prompt for search term and CUSIP
+        search_term = input("Enter search term (default: GameStop): ") or "GameStop"
+        cusip = input("Enter CUSIP (default: 36467W109): ") or "36467W109"
+        print(f"Using search term: {search_term}, CUSIP: {cusip}")
+        final_df = parse_all_filings(search_term=search_term, cusip=cusip)
+    if query == 'count':
+        count()
+    if query == 'count2':
+        count2()
     if query == '6':
         download_nport_archives()
         search_keyword = input("Enter the keyword to search for (e.g., 'Gamestop'): ").strip() or 'gamestop'
-        search_for_swaps = input("Searching for swaps? (s for swaps, enter for other positions): ").lower() == 's'
         verbose = input("Enable verbose mode? (y/n): ").lower() == 'y'
-        search_nport(search_keyword, verbose, search_for_swaps)
+        search_nport(search_keyword, verbose)
     elif query == '9':
         download_ncen_archives()
+        search_keywords = input("Enter the keyword to search for (e.g., 'Gamestop'): ").strip() or 'gamestop'
+        verbose = input("Enable verbose mode? (y/n): ").lower() == 'y'
+        search_ncen(search_keywords, verbose=verbose)
     elif query == '4':
         download_formd_archives()
     elif query == '2':
         download_nmfp_archives()
+        search_keywords = input("Enter the keyword to search for (e.g., 'Gamestop'): ").strip() or 'gamestop'
+        verbose = input("Enable verbose mode? (y/n): ").lower() == 'y'
+        search_nmfp(search_keywords, verbose=False)
     elif query == '0':
         download_13F_archives()
     elif query == 'g':
@@ -4314,40 +5593,151 @@ if __name__ == "__main__":
         download_cftc_equities_archives()
     elif query == 'm3':
         download_cftc_commodities_archives()
+    elif query == 'm4':
+        download_cftc_forex_archives()
+    elif query == 'm5':
+        download_cftc_rates_archives()
     elif query == 'e':
         # Download Edgar Archives
         download_edgar_archives()
-        # Here we assume 'edgar_second' has created a CSV in the directory
         while True:
-            csv_files = list_csv_files(EDGAR_SOURCE_DIR)
-            if not csv_files:
-                print("No CSV files found. Exiting to main menu.")
-                # Search through the archives and create CSV
+            print("\nWhat would you like to do with the downloaded Edgar archives?")
+            print("1: Search the archives for a company name")
+            print("2: Scrape Edgar for filings based on a CIK")
+            print("3: Download filings using existing search results")
+            print("0: Exit to main menu")
+            
+            choice = input("Enter your choice (0-3): ").strip()
+            if choice == '0':
+                break
+            
+            elif choice == '1':
                 edgar_second()
-                break
+            
+            elif choice == '2':
+                cik = input("Enter the CIK to scrape (e.g., '0000320193' for Apple): ").strip()
+                if cik.isdigit() and 1 <= len(cik) <= 10:  # Validate CIK length
+                    # Use original functions for scraping
+                    sec_url_full = f"https://www.sec.gov/Archives/edgar/data/{cik}/"
+                    print(f"Embarking on the quest for {sec_url_full}...")
+                    base_download_dir = EDGAR_SOURCE_DIR
+                    folder_name = sec_url_full.rstrip('/').split('/')[-1]
+                    full_download_directory = os.path.join(base_download_dir, folder_name)
+                    print(f"Full download directory: {full_download_directory} - Here lies our treasure vault")
 
-            print("Available CSV files (without '_results.csv'):")
-            for i, file in enumerate(csv_files):
-                print(f"{i + 1}: {file[:-len('_results.csv')]}")
+                    subdirectories = scrape_subdirectories(sec_url_full)
+                    if not subdirectories:
+                        print(f"No hidden chambers found at {sec_url_full}. Exiting this quest.")
+                        continue
 
-            file_choice = int(input("Select a CSV file by number or enter 0 to exit: "))
-            if file_choice == 0:
-                break
+                    full_subdirectory_urls = [f"{sec_url_full.rstrip('/')}/{sub}" for sub in subdirectories]
+                    
+                    sanitized_file_path = 'sanitized_subdirectories.txt'
+                    with open(sanitized_file_path, 'w') as sanitized_file:
+                        sanitized_file.write('\n'.join(full_subdirectory_urls))
+                    print(f"Sanitized list created: {sanitized_file_path} - The map to hidden chambers is drawn")
 
-            if 1 <= file_choice <= len(csv_files):
-                csv_file = csv_files[file_choice - 1]
-                print(f"Selected CSV file: {csv_file}")
-                CSV_EXTRACTION_METHOD = input("Use archives URL listings or crawl SEC site? (options are 'url' or 'crawl'): ").strip()
-                if CSV_EXTRACTION_METHOD == 'url':
-                    edgar_third(csv_file, 'url')
-                elif CSV_EXTRACTION_METHOD == 'crawl':
-                    edgar_third(csv_file, 'crawl')
+                    output_file_path = 'completed_subdirectories.txt'
+                    if os.path.exists(output_file_path):
+                        with open(output_file_path, 'r') as file:
+                            completed_subdirectories = [line.strip() for line in file]
+                    else:
+                        completed_subdirectories = []
+
+                    os.makedirs(full_download_directory, exist_ok=True)
+                    print(f"Download directory created: {full_download_directory} - The vault is ready to receive its riches")
+
+                    total_subdirectories = len(full_subdirectory_urls)
+                    processed_subdirectories = len(completed_subdirectories)
+                    rows = []  # List to store download results
+
+                    for subdirectory in full_subdirectory_urls:
+                        if subdirectory in completed_subdirectories:
+                            print(f"Skipping already plundered chamber: {subdirectory}")
+                            continue
+
+                        print(f"Venturing into the chamber: {subdirectory}")
+                        try:
+                            soup = fetch_directory(subdirectory)
+                            txt_links = extract_txt_links(soup)
+                            print(f"Found txt links in {subdirectory}: {txt_links} - Scrolls of lore discovered")
+                            for txt_link in txt_links:
+                                txt_url = "https://www.sec.gov" + txt_link
+                                print(f"Downloading txt file: {txt_url} - Securing the scroll")
+                                download_success = download_file(txt_url, full_download_directory)
+                                download_location = os.path.join(full_download_directory, os.path.basename(txt_url)) if download_success else 'Failed'
+                                rows.append([cik, txt_url, download_location, 'Success' if download_success else 'Failed'])
+                                if download_success:
+                                    with open(output_file_path, 'a') as completed_file:
+                                        completed_file.write(subdirectory + '\n')
+                                    break
+                                time.sleep(0.1)  # Avoid rate limiting
+                        except Exception as e:
+                            print(f"Failed to access {subdirectory}: {e} - Beware, for this path is cursed!")
+                            with open('error_log.txt', 'a') as error_log_file:
+                                error_log_file.write(f"Failed to access {subdirectory}: {e}\n")
+
+                        processed_subdirectories += 1
+                        print(f"Progress: {processed_subdirectories}/{total_subdirectories} chambers explored.")
+
+                    remaining_subdirectories = [sub for sub in full_subdirectory_urls if sub not in completed_subdirectories]
+                    with open(sanitized_file_path, 'w') as sanitized_file:
+                        sanitized_file.write('\n'.join(remaining_subdirectories))
+
+                    # Create CSV and HTML output
+                    csv_file = os.path.join(EDGAR_SOURCE_DIR, f"{cik}_scraped_results.csv")
+                    with open(csv_file, 'w', newline='') as csvfile:
+                        writer = csv.writer(csvfile)
+                        writer.writerow(['CIK', 'URL', 'Download Location', 'Status'])
+                        writer.writerows(rows)
+                    html_file = os.path.join(EDGAR_SOURCE_DIR, f"{cik}_scraped_index.html")
+                    with open(html_file, 'w', encoding='utf-8') as htmlfile:
+                        htmlfile.write('<!DOCTYPE html><html><head><title>Scraped Index</title></head><body><table border="1">')
+                        htmlfile.write('<tr>' + ''.join(f'<th>{h}</th>' for h in ['CIK', 'URL', 'Download Location', 'Status']) + '</tr>')
+                        for row in rows:
+                            htmlfile.write('<tr>')
+                            for item in row:
+                                if item.startswith('./edgar') or item == 'Failed':
+                                    htmlfile.write(f'<td><a href="file://{os.path.abspath(item)}">{item}</a></td>' if item != 'Failed' else f'<td>{item}</td>')
+                                else:
+                                    htmlfile.write(f'<td><a href="{item}">{item}</a></td>')
+                            htmlfile.write('</tr>')
+                        htmlfile.write('</table></body></html>')
+                    print(f"Scraping complete. Results saved to {csv_file} and {html_file}")
                 else:
-                    print("Please enter 'url' or 'crawl'.")
+                    print("Invalid CIK. Please enter a 10- or 12-digit number.")
+            
+            elif choice == '3':
+                csv_files = list_csv_files(EDGAR_SOURCE_DIR)
+                if not csv_files:
+                    print("No CSV files found. Please search the archives first (option 1).")
                     continue
-                print("Processing of CSV URLs complete.")
+                print("Available CSV files (without '_results.csv'):")
+                for i, file in enumerate(csv_files):
+                    print(f"{i + 1}: {file[:-len('_results.csv')]}")
+                while True:
+                    file_choice = input("Select a CSV file by number (or '0' to return to menu): ").strip()
+                    if file_choice == '0':
+                        break
+                    try:
+                        file_choice = int(file_choice)
+                        if 1 <= file_choice <= len(csv_files):
+                            csv_file = csv_files[file_choice - 1]
+                            method = input("Use 'url' or 'crawl' method: ").strip().lower()
+                            if method in ['url', 'crawl']:
+                                edgar_third(csv_file, method)
+                                repeat = input("Process another CSV? (yes/no): ").strip().lower()
+                                if repeat != 'yes':
+                                    break
+                            else:
+                                print("Please enter 'url' or 'crawl'.")
+                        else:
+                            print("Invalid choice.")
+                    except ValueError:
+                        print("Please enter a valid number.")
+            
             else:
-                print("Invalid choice.")
+                print("Invalid choice. Please enter 0-3.")
     elif query == 'r':
         download_exchange_archives()
     elif query == 'i':
@@ -4356,6 +5746,10 @@ if __name__ == "__main__":
         codex()
     elif query == 'a':
         allyourbasearebelongtous()
+    elif query == 'edgartotal':
+        edgartotal()
+    elif query == 'n':
+        download_ncsr_filings()
     else:
         print("Invalid input. Please enter one of the following: 69420gmerica.")
         exit(1)
