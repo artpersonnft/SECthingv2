@@ -6,7 +6,7 @@ from zipfile import ZipFile
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 from urllib.error import HTTPError, URLError
-from lxml import etree
+
 
 # Native Python modulesss
 native_modules = [
@@ -17,7 +17,7 @@ native_modules = [
 
 # Non-native Python modules for third-party installation
 third_party_modules = [
-    'chardet', 'pandas', 'requests', 'bs4', 'tqdm'
+    'chardet', 'pandas', 'requests', 'bs4', 'tqdm', 'lxml'
 ]
 # Constants
 ROOT_DIR = "./"
@@ -97,8 +97,7 @@ def check_and_install_modules():
             except subprocess.CalledProcessError:
                 print(f"Failed to install {module}. Please install it manually.")
 def import_modules():
-    global chardet, concurrent, requests, BeautifulSoup, tqdm, pd
-
+    global chardet, concurrent, requests, BeautifulSoup, tqdm, pd, etree
     # Third-party modules
     import chardet
     import concurrent.futures as concurrent
@@ -106,7 +105,7 @@ def import_modules():
     from bs4 import BeautifulSoup
     from tqdm import tqdm
     import pandas as pd
-
+    from lxml import etree
     # Specific imports from concurrent.futures
     from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 def gamecock_ascii():
