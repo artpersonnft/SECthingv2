@@ -83,32 +83,41 @@ for dissem_id in unique_dissem_ids:
         chains[root_id] = []
     chains[root_id].append(dissem_id)
 
-# Identify chains not terminated (no TERM in the chain's final event)
+# Identify chains not terminated (no TERM in the chain's final event) and starting with NEWT
 open_chains = []
 for root_id, chain_ids in chains.items():
-    # Get the latest event in the chain (highest timestamp or last Dissemination ID)
+    # Get all events in the chain
     chain_df = df[df['Dissemination Identifier'].isin(chain_ids)]
     chain_df['Event timestamp'] = pd.to_datetime(chain_df['Event timestamp'])
+    
+    # Get the root event (earliest in the chain, typically NEWT)
+    root_event = chain_df[chain_df['Dissemination Identifier'] == root_id]
+    if root_event.empty or root_event['Action type'].iloc[0] != 'NEWT':
+        continue  # Skip chains where the root is not NEWT
+    
+    # Get the latest event in the chain based on Event timestamp
     latest_event = chain_df.loc[chain_df['Event timestamp'].idxmax()]
     if latest_event['Action type'] != 'TERM':
         open_chains.append({
             'Root ID': root_id,
             'Last Dissemination ID': latest_event['Dissemination Identifier'],
             'Last Action': latest_event['Action type'],
-            'Last Timestamp': latest_event['Event timestamp'],
+            'Event Timestamp': latest_event['Event timestamp'],  # Renamed to Event Timestamp
+            'Execution Timestamp': latest_event['Execution Timestamp'],  # Added Execution Timestamp
             'Expiration Date': latest_event['Expiration Date'],
             'Swap Type': latest_event['Product name']
         })
 
 # Print open chains
 print(f"\nTotal unique position chains: {len(chains)}")
-print(f"Open (non-TERM'd) chains: {len(open_chains)}")
+print(f"Open (non-TERM'd) chains starting with NEWT: {len(open_chains)}")
 print("\nDetails of open chains (not terminated by TERM):")
 for chain in open_chains:
     print(f"Root ID: {chain['Root ID']}")
     print(f"Last Dissemination ID: {chain['Last Dissemination ID']}")
     print(f"Last Action: {chain['Last Action']}")
-    print(f"Last Timestamp: {chain['Last Timestamp']}")
+    print(f"Event Timestamp: {chain['Event Timestamp']}")
+    print(f"Execution Timestamp: {chain['Execution Timestamp']}")
     print(f"Expiration Date: {chain['Expiration Date']}")
     print(f"Swap Type: {chain['Swap Type']}")
     print("-" * 50)
