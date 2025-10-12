@@ -5551,8 +5551,10 @@ if __name__ == "__main__":
     print("n: create an N-CSR archive from edgar indexes")
 
     query = input("Enter the number corresponding to your choice: ").strip()
-    if query.isdigit() and len(query) == 7:
-        process_cik(query)  # Call it directly
+    if query.isdigit() and 4 <= len(query) <= 7:
+        process_cik(query)  # Call the function with the valid CIK
+    else:
+        print("Invalid CIK. Please enter a number with 4 to 7 digits.")
     if query == 'chain':
         # Prompt for search term and CUSIP
         search_term = input("Enter search term (default: GameStop): ") or "GameStop"
