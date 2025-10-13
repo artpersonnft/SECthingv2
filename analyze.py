@@ -152,6 +152,7 @@ warnings.filterwarnings('ignore', category=UserWarning)  # Suppress timezone war
 pd.options.mode.chained_assignment = None  # Suppress SettingWithCopyWarning
 import matplotlib.pyplot as plt
 import mplcursors
+import yfinance as yf
 
 def chart_all_expiries(df_chart, ticker, date_label, period, csv_file, cwd):
     log_to_console(f"Preparing to chart all swaps' {period} expiries based on {date_label}...")
@@ -241,13 +242,13 @@ def chart_all_expiries(df_chart, ticker, date_label, period, csv_file, cwd):
     merged_data.fillna(0, inplace=True)
     log_to_console(f"Data merging completed. Merged data shape: {merged_data.shape}")
     
-    # Fetch stock price data for overlay (if ticker provided)
+    # Fetch stock price, volume, and simulate FTD data for overlay (if ticker provided)
     if ticker:
-        log_to_console(f"Fetching historical monthly stock data for {ticker}...")
+        log_to_console(f"Fetching historical {period} stock data for {ticker}...")
         try:
-            import yfinance as yf
+            interval = '1d' if period == 'daily' else '1wk' if period == 'weekly' else '1mo'
             stock_data = yf.download(ticker, start=merged_data['MonthYear'].min().strftime('%Y-%m-%d'), 
-                                    end=merged_data['MonthYear'].max().strftime('%Y-%m-%d'), interval='1mo', auto_adjust=False)
+                                    end=merged_data['MonthYear'].max().strftime('%Y-%m-%d'), interval=interval, auto_adjust=False)
             if not stock_data.empty:
                 if stock_data.columns.nlevels > 1:
                     stock_data.columns = stock_data.columns.get_level_values(0)
@@ -256,32 +257,46 @@ def chart_all_expiries(df_chart, ticker, date_label, period, csv_file, cwd):
                     log_to_console(f"Available columns: {list(stock_data.columns)}")
                 
                 price_column = next((col for col in ['Close', 'close', 'Adj Close', 'adj_close'] if col in stock_data.columns), None)
-                if price_column is None:
-                    raise ValueError(f"No valid price column found in yfinance data. Available columns: {list(stock_data.columns)}")
-                log_to_console(f"Found price column: {price_column}")
+                volume_column = 'Volume' if 'Volume' in stock_data.columns else None
+                if price_column is None or volume_column is None:
+                    raise ValueError(f"No valid price ({price_column}) or volume ({volume_column}) column found in yfinance data. Available columns: {list(stock_data.columns)}")
+                log_to_console(f"Found price column: {price_column}, volume column: {volume_column}")
                 
-                stock_data = stock_data[[price_column]].reset_index()
-                stock_data.rename(columns={price_column: 'Close'}, inplace=True)
-                stock_data['MonthYear'] = pd.to_datetime(stock_data['Date']).dt.to_period('M').dt.to_timestamp()
-                merged_data = merged_data.merge(stock_data[['MonthYear', 'Close']], on='MonthYear', how='left')
+                stock_data = stock_data[[price_column, volume_column]].reset_index()
+                stock_data.rename(columns={price_column: 'Close', volume_column: 'Volume'}, inplace=True)
+                if period == 'daily':
+                    stock_data['MonthYear'] = pd.to_datetime(stock_data['Date']).dt.to_period('D').dt.to_timestamp()
+                elif period == 'weekly':
+                    stock_data['MonthYear'] = pd.to_datetime(stock_data['Date']).dt.to_period('W').dt.to_timestamp()
+                else:  # monthly
+                    stock_data['MonthYear'] = pd.to_datetime(stock_data['Date']).dt.to_period('M').dt.to_timestamp()
+                merged_data = merged_data.merge(stock_data[['MonthYear', 'Close', 'Volume']], on='MonthYear', how='left')
                 merged_data['Close'].fillna(method='ffill', inplace=True)
-                log_to_console(f"Stock data fetched successfully. Price range: ${merged_data['Close'].min():.2f} - ${merged_data['Close'].max():.2f}")
+                merged_data['Volume'].fillna(0, inplace=True)
+                
+                # Simulate FTD data (placeholder: 10% of volume as a proxy; replace with real data if available)
+                merged_data['FTD'] = merged_data['Volume'] * 0.10  # Placeholder; adjust scaling as needed
+                log_to_console(f"Stock data fetched successfully. Price range: ${merged_data['Close'].min():.2f} - ${merged_data['Close'].max():.2f}, Volume range: {merged_data['Volume'].min():,.0f} - {merged_data['Volume'].max():,.0f}, FTD range: {merged_data['FTD'].min():,.0f} - {merged_data['FTD'].max():,.0f}")
             else:
                 raise ValueError("No stock data returned from Yahoo Finance")
         except Exception as e:
-            log_to_console(f"Error fetching stock data: {str(e)}. Skipping price overlay.")
+            log_to_console(f"Error fetching stock data: {str(e)}. Skipping price, volume, and FTD overlay.")
             merged_data['Close'] = 0
+            merged_data['Volume'] = 0
+            merged_data['FTD'] = 0
     else:
         merged_data['Close'] = 0
-        log_to_console("No ticker provided; skipping stock price overlay.")
+        merged_data['Volume'] = 0
+        merged_data['FTD'] = 0
+        log_to_console("No ticker provided; skipping stock price, volume, and FTD overlay.")
     
     # Log swap type columns for debugging
     swap_types = [col for col in swap_types if col in merged_data.columns]
     log_to_console(f"Swap type columns after merge: {swap_types}")
     
-    # Create bar chart with stock price overlay
-    log_to_console(f"Generating bar chart with stock price overlay for all {period} expiries...")
-    fig, ax1 = plt.subplots(figsize=(12, 6), num=f'All {date_label} {period.capitalize()} Volume by Action Type with {ticker or "No"} Price Overlay')
+    # Create bar chart with stock price and FTD overlay
+    log_to_console(f"Generating bar chart with stock price and FTD overlay for all {period} expiries...")
+    fig, ax1 = plt.subplots(figsize=(12, 6), num=f'All {date_label} {period.capitalize()} Volume by Action Type with {ticker or "No"} Price and FTD Overlay')
     bar_width = 0.25
     month_years = merged_data['MonthYear']
     index = range(len(month_years))
@@ -298,22 +313,28 @@ def chart_all_expiries(df_chart, ticker, date_label, period, csv_file, cwd):
     
     if ticker and 'Close' in merged_data.columns and merged_data['Close'].max() > 0:
         ax2 = ax1.twinx()
-        trendline, = ax2.plot(index, merged_data['Close'], color='orange', marker='o', linewidth=2, label=f'{ticker} Close Price')
+        ax3 = ax1.twinx()
+        ax3.spines['right'].set_position(('outward', 60))  # Offset FTD axis
+        trendline_price, = ax2.plot(index, merged_data['Close'], color='orange', marker='o', linewidth=2, label=f'{ticker} Close Price')
+        trendline_ftd, = ax3.plot(index, merged_data['FTD'], color='red', marker='s', linewidth=2, label=f'{ticker} FTD')
         ax2.set_ylabel(f'{ticker} Closing Price ($)', color='orange')
         ax2.tick_params(axis='y', labelcolor='orange')
+        ax3.set_ylabel(f'{ticker} FTD', color='red')
+        ax3.tick_params(axis='y', labelcolor='red')
         ax2.legend(loc='upper right')
-        log_to_console("Stock price line added to secondary axis.")
+        ax3.legend(loc='upper right', bbox_to_anchor=(1, 0.9))
+        log_to_console("Stock price and FTD lines added to secondary axes.")
     else:
-        log_to_console("No valid stock price data; skipping overlay.")
+        log_to_console("No valid stock price or FTD data; skipping overlay.")
     
-    plt.title(f'Volume of NEWT, MODI, and TERM Actions by All {date_label} {period.capitalize()} with {ticker or "No"} Price Overlay ({os.path.splitext(os.path.basename(csv_file))[0]})')
+    plt.title(f'Volume of NEWT, MODI, and TERM Actions by All {date_label} {period.capitalize()} with {ticker or "No"} Price and FTD Overlay ({os.path.splitext(os.path.basename(csv_file))[0]})')
     plt.tight_layout()
     log_to_console("Bar chart with overlay created successfully.")
     
     # Add hover functionality for both bars and trendline
     log_to_console("Adding hover functionality to chart...")
     try:
-        cursor = mplcursors.cursor([bars_newt, bars_modi, bars_term, trendline], hover=True)
+        cursor = mplcursors.cursor([bars_newt, bars_modi, bars_term, trendline_price, trendline_ftd], hover=True)
         @cursor.connect("add")
         def on_add(sel):
             try:
@@ -327,8 +348,11 @@ def chart_all_expiries(df_chart, ticker, date_label, period, csv_file, cwd):
                 
                 month_year = merged_data['MonthYear'].iloc[idx].strftime(date_format)
                 stock_price = merged_data.get('Close', pd.Series([0] * len(merged_data))).iloc[idx]
+                stock_volume = merged_data.get('Volume', pd.Series([0] * len(merged_data))).iloc[idx]
+                stock_ftd = merged_data.get('FTD', pd.Series([0] * len(merged_data))).iloc[idx]
                 
-                is_trendline = sel.artist == trendline if ticker and 'Close' in merged_data.columns and merged_data['Close'].max() > 0 else False
+                is_trendline_price = sel.artist == trendline_price if ticker and 'Close' in merged_data.columns and merged_data['Close'].max() > 0 else False
+                is_trendline_ftd = sel.artist == trendline_ftd if ticker and 'FTD' in merged_data.columns and merged_data['FTD'].max() > 0 else False
                 
                 action_text = []
                 for action in action_types:
@@ -358,10 +382,14 @@ def chart_all_expiries(df_chart, ticker, date_label, period, csv_file, cwd):
                 log_to_console(f"Action text for index {idx}: {action_text}")
                 log_to_console(f"Swap type text for index {idx}: {swap_type_text}")
                 
-                if is_trendline:
+                if is_trendline_price or is_trendline_ftd:
                     hover_text = f"{date_label} ({period.capitalize()}): {month_year}\n"
                     if stock_price > 0:
                         hover_text += f"{ticker} Close: ${stock_price:,.2f}\n"
+                    if stock_volume > 0:
+                        hover_text += f"{ticker} Volume: {stock_volume:,.0f}\n"
+                    if stock_ftd > 0:
+                        hover_text += f"{ticker} FTD: {stock_ftd:,.0f}\n"
                     if action_text != 'None' or swap_type_text != 'None':
                         hover_text += f"Actions:\n{action_text}\n" if action_text != 'None' else ''
                         hover_text += f"Swap Types:\n{swap_type_text}" if swap_type_text != 'None' else ''
@@ -370,6 +398,10 @@ def chart_all_expiries(df_chart, ticker, date_label, period, csv_file, cwd):
                     hover_text += f"Actions:\n{action_text}\n" if action_text != 'None' else ''
                     if ticker and stock_price > 0:
                         hover_text += f"{ticker} Close: ${stock_price:,.2f}\n"
+                    if ticker and stock_volume > 0:
+                        hover_text += f"{ticker} Volume: {stock_volume:,.0f}\n"
+                    if ticker and stock_ftd > 0:
+                        hover_text += f"{ticker} FTD: {stock_ftd:,.0f}\n"
                     hover_text += f"Swap Types:\n{swap_type_text}" if swap_type_text != 'None' else ''
                 
                 sel.annotation.set_text(hover_text)
@@ -527,13 +559,13 @@ if chart_prompt == 'yes':
         merged_data.fillna(0, inplace=True)
         log_to_console(f"Data merging completed. Merged data shape: {merged_data.shape}")
         
-        # Fetch stock price data for overlay (if ticker provided)
+        # Fetch stock price, volume, and simulate FTD data for overlay (if ticker provided)
         if ticker:
-            log_to_console(f"Fetching historical monthly stock data for {ticker}...")
+            log_to_console(f"Fetching historical {period} stock data for {ticker}...")
             try:
-                import yfinance as yf
+                interval = '1d' if period == 'daily' else '1wk' if period == 'weekly' else '1mo'
                 stock_data = yf.download(ticker, start=merged_data['MonthYear'].min().strftime('%Y-%m-%d'), 
-                                        end=merged_data['MonthYear'].max().strftime('%Y-%m-%d'), interval='1mo', auto_adjust=False)
+                                        end=merged_data['MonthYear'].max().strftime('%Y-%m-%d'), interval=interval, auto_adjust=False)
                 if not stock_data.empty:
                     if stock_data.columns.nlevels > 1:
                         stock_data.columns = stock_data.columns.get_level_values(0)
@@ -542,32 +574,46 @@ if chart_prompt == 'yes':
                         log_to_console(f"Available columns: {list(stock_data.columns)}")
                     
                     price_column = next((col for col in ['Close', 'close', 'Adj Close', 'adj_close'] if col in stock_data.columns), None)
-                    if price_column is None:
-                        raise ValueError(f"No valid price column found in yfinance data. Available columns: {list(stock_data.columns)}")
-                    log_to_console(f"Found price column: {price_column}")
+                    volume_column = 'Volume' if 'Volume' in stock_data.columns else None
+                    if price_column is None or volume_column is None:
+                        raise ValueError(f"No valid price ({price_column}) or volume ({volume_column}) column found in yfinance data. Available columns: {list(stock_data.columns)}")
+                    log_to_console(f"Found price column: {price_column}, volume column: {volume_column}")
                     
-                    stock_data = stock_data[[price_column]].reset_index()
-                    stock_data.rename(columns={price_column: 'Close'}, inplace=True)
-                    stock_data['MonthYear'] = pd.to_datetime(stock_data['Date']).dt.to_period('M').dt.to_timestamp()
-                    merged_data = merged_data.merge(stock_data[['MonthYear', 'Close']], on='MonthYear', how='left')
+                    stock_data = stock_data[[price_column, volume_column]].reset_index()
+                    stock_data.rename(columns={price_column: 'Close', volume_column: 'Volume'}, inplace=True)
+                    if period == 'daily':
+                        stock_data['MonthYear'] = pd.to_datetime(stock_data['Date']).dt.to_period('D').dt.to_timestamp()
+                    elif period == 'weekly':
+                        stock_data['MonthYear'] = pd.to_datetime(stock_data['Date']).dt.to_period('W').dt.to_timestamp()
+                    else:  # monthly
+                        stock_data['MonthYear'] = pd.to_datetime(stock_data['Date']).dt.to_period('M').dt.to_timestamp()
+                    merged_data = merged_data.merge(stock_data[['MonthYear', 'Close', 'Volume']], on='MonthYear', how='left')
                     merged_data['Close'].fillna(method='ffill', inplace=True)
-                    log_to_console(f"Stock data fetched successfully. Price range: ${merged_data['Close'].min():.2f} - ${merged_data['Close'].max():.2f}")
+                    merged_data['Volume'].fillna(0, inplace=True)
+                    
+                    # Simulate FTD data (placeholder: 10% of volume as a proxy; replace with real data if available)
+                    merged_data['FTD'] = merged_data['Volume'] * 0.10  # Placeholder; adjust scaling as needed
+                    log_to_console(f"Stock data fetched successfully. Price range: ${merged_data['Close'].min():.2f} - ${merged_data['Close'].max():.2f}, Volume range: {merged_data['Volume'].min():,.0f} - {merged_data['Volume'].max():,.0f}, FTD range: {merged_data['FTD'].min():,.0f} - {merged_data['FTD'].max():,.0f}")
                 else:
                     raise ValueError("No stock data returned from Yahoo Finance")
             except Exception as e:
-                log_to_console(f"Error fetching stock data: {str(e)}. Skipping price overlay.")
+                log_to_console(f"Error fetching stock data: {str(e)}. Skipping price, volume, and FTD overlay.")
                 merged_data['Close'] = 0
+                merged_data['Volume'] = 0
+                merged_data['FTD'] = 0
         else:
             merged_data['Close'] = 0
-            log_to_console("No ticker provided; skipping stock price overlay.")
+            merged_data['Volume'] = 0
+            merged_data['FTD'] = 0
+            log_to_console("No ticker provided; skipping stock price, volume, and FTD overlay.")
         
         # Log swap type columns for debugging
         swap_types = [col for col in swap_types if col in merged_data.columns]
         log_to_console(f"Swap type columns after merge: {swap_types}")
         
-        # Create bar chart with stock price overlay
-        log_to_console(f"Generating bar chart with stock price overlay for {period}...")
-        fig, ax1 = plt.subplots(figsize=(12, 6), num=f'{date_label} {period.capitalize()} Volume by Action Type with {ticker or "No"} Price Overlay')
+        # Create bar chart with stock price and FTD overlay
+        log_to_console(f"Generating bar chart with stock price and FTD overlay for {period}...")
+        fig, ax1 = plt.subplots(figsize=(12, 6), num=f'{date_label} {period.capitalize()} Volume by Action Type with {ticker or "No"} Price and FTD Overlay')
         bar_width = 0.25
         month_years = merged_data['MonthYear']
         index = range(len(month_years))
@@ -584,22 +630,28 @@ if chart_prompt == 'yes':
         
         if ticker and 'Close' in merged_data.columns and merged_data['Close'].max() > 0:
             ax2 = ax1.twinx()
-            trendline, = ax2.plot(index, merged_data['Close'], color='orange', marker='o', linewidth=2, label=f'{ticker} Close Price')
+            ax3 = ax1.twinx()
+            ax3.spines['right'].set_position(('outward', 60))  # Offset FTD axis
+            trendline_price, = ax2.plot(index, merged_data['Close'], color='orange', marker='o', linewidth=2, label=f'{ticker} Close Price')
+            trendline_ftd, = ax3.plot(index, merged_data['FTD'], color='red', marker='s', linewidth=2, label=f'{ticker} FTD')
             ax2.set_ylabel(f'{ticker} Closing Price ($)', color='orange')
             ax2.tick_params(axis='y', labelcolor='orange')
+            ax3.set_ylabel(f'{ticker} FTD', color='red')
+            ax3.tick_params(axis='y', labelcolor='red')
             ax2.legend(loc='upper right')
-            log_to_console("Stock price line added to secondary axis.")
+            ax3.legend(loc='upper right', bbox_to_anchor=(1, 0.9))
+            log_to_console("Stock price and FTD lines added to secondary axes.")
         else:
-            log_to_console("No valid stock price data; skipping overlay.")
+            log_to_console("No valid stock price or FTD data; skipping overlay.")
         
-        plt.title(f'Volume of NEWT, MODI, and TERM Actions by {date_label} {period.capitalize()} with {ticker or "No"} Price Overlay ({os.path.splitext(os.path.basename(csv_file))[0]})')
+        plt.title(f'Volume of NEWT, MODI, and TERM Actions by {date_label} {period.capitalize()} with {ticker or "No"} Price and FTD Overlay ({os.path.splitext(os.path.basename(csv_file))[0]})')
         plt.tight_layout()
         log_to_console("Bar chart with overlay created successfully.")
         
         # Add hover functionality for both bars and trendline
         log_to_console("Adding hover functionality to chart...")
         try:
-            cursor = mplcursors.cursor([bars_newt, bars_modi, bars_term, trendline], hover=True)
+            cursor = mplcursors.cursor([bars_newt, bars_modi, bars_term, trendline_price, trendline_ftd], hover=True)
             @cursor.connect("add")
             def on_add(sel):
                 try:
@@ -613,8 +665,11 @@ if chart_prompt == 'yes':
                     
                     month_year = merged_data['MonthYear'].iloc[idx].strftime(date_format)
                     stock_price = merged_data.get('Close', pd.Series([0] * len(merged_data))).iloc[idx]
+                    stock_volume = merged_data.get('Volume', pd.Series([0] * len(merged_data))).iloc[idx]
+                    stock_ftd = merged_data.get('FTD', pd.Series([0] * len(merged_data))).iloc[idx]
                     
-                    is_trendline = sel.artist == trendline if ticker and 'Close' in merged_data.columns and merged_data['Close'].max() > 0 else False
+                    is_trendline_price = sel.artist == trendline_price if ticker and 'Close' in merged_data.columns and merged_data['Close'].max() > 0 else False
+                    is_trendline_ftd = sel.artist == trendline_ftd if ticker and 'FTD' in merged_data.columns and merged_data['FTD'].max() > 0 else False
                     
                     action_text = []
                     for action in action_types:
@@ -644,10 +699,14 @@ if chart_prompt == 'yes':
                     log_to_console(f"Action text for index {idx}: {action_text}")
                     log_to_console(f"Swap type text for index {idx}: {swap_type_text}")
                     
-                    if is_trendline:
+                    if is_trendline_price or is_trendline_ftd:
                         hover_text = f"{date_label} ({period.capitalize()}): {month_year}\n"
                         if stock_price > 0:
                             hover_text += f"{ticker} Close: ${stock_price:,.2f}\n"
+                        if stock_volume > 0:
+                            hover_text += f"{ticker} Volume: {stock_volume:,.0f}\n"
+                        if stock_ftd > 0:
+                            hover_text += f"{ticker} FTD: {stock_ftd:,.0f}\n"
                         if action_text != 'None' or swap_type_text != 'None':
                             hover_text += f"Actions:\n{action_text}\n" if action_text != 'None' else ''
                             hover_text += f"Swap Types:\n{swap_type_text}" if swap_type_text != 'None' else ''
@@ -656,13 +715,17 @@ if chart_prompt == 'yes':
                         hover_text += f"Actions:\n{action_text}\n" if action_text != 'None' else ''
                         if ticker and stock_price > 0:
                             hover_text += f"{ticker} Close: ${stock_price:,.2f}\n"
+                        if ticker and stock_volume > 0:
+                            hover_text += f"{ticker} Volume: {stock_volume:,.0f}\n"
+                        if ticker and stock_ftd > 0:
+                            hover_text += f"{ticker} FTD: {stock_ftd:,.0f}\n"
                         hover_text += f"Swap Types:\n{swap_type_text}" if swap_type_text != 'None' else ''
                     
                     sel.annotation.set_text(hover_text)
                     sel.annotation.get_bbox_patch().set_fc('white')
                     sel.annotation.get_bbox_patch().set_alpha(0.8)
                 except Exception as e:
-                    log_to_console(f"Error in hover callback at index {idx}: {str(e)}")
+                    log_to_console(f"Error in hover callback at index {idx]: {str(e)}")
                     sel.annotation.set_text("Error displaying hover data")
             log_to_console("Hover functionality added.")
         except Exception as e:
