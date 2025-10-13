@@ -1154,7 +1154,7 @@ def equities_second():
     
     def parse_zips(search_terms):
         master = pd.DataFrame()  # Start with an empty dataframe
-        zip_files = sorted(glob.glob(os.path.join(EQUITY_SOURCE_DIR, '*.zip')), key=lambda x: os.path.basename(x))  # Sort by filename to keep dates in order
+        zip_files = sorted(glob.glob(os.path.join(EQUITY_SOURCE_DIR, '*.zip')), key=lambda x: os.path.basename(x))  # Sort by filename
         first_file_processed = False
         first_headers = None
         total_files = len(zip_files)
@@ -1164,7 +1164,7 @@ def equities_second():
             print(f"\nProcessing file {index}/{total_files}: {zip_file}")
             try:
                 with ZipFile(zip_file, 'r') as zip_ref:
-                    csv_filename = zip_ref.namelist()[0]  # Assuming only one CSV per zip
+                    csv_filename = zip_ref.namelist()[0]  # Assuming one CSV per zip
                     print(f"Reading CSV file: {csv_filename}")
                     with zip_ref.open(csv_filename) as csv_file:
                         df = pd.read_csv(csv_file, low_memory=False)
@@ -1173,15 +1173,23 @@ def equities_second():
                             first_file_processed = True
                         # Combine all columns into a single string per row
                         df['combined'] = df.apply(lambda row: ' '.join(row.astype(str)), axis=1)
-                        # Create a pattern for OR condition
-                        pattern = '|'.join(search_terms)
-                        # Find rows where any search term appears
-                        mask = df['combined'].str.contains(pattern, case=False, na=False)
-                        matching_rows = df[mask]
+                        matching_rows = pd.DataFrame()  # Store matches for this file
+                        for term in search_terms:
+                            is_quoted = term.startswith('"') and term.endswith('"')
+                            clean_term = term.strip('"') if is_quoted else term
+                            # Wider scope for unquoted terms (anywhere in combined)
+                            if not is_quoted:
+                                mask = df['combined'].str.contains(clean_term, case=False, na=False)
+                            # Limited scope for quoted terms (exact match in Product name, no suffixes)
+                            else:
+                                mask = df['Product name'].astype(str).str.contains(fr'\b{re.escape(clean_term)}\b', case=False, na=False)
+                            temp_rows = df[mask].copy()
+                            if not temp_rows.empty:
+                                temp_rows['SearchTerm'] = term  # Track original term
+                                matching_rows = pd.concat([matching_rows, temp_rows], ignore_index=True)
                         # Drop the 'combined' column if it exists
                         if 'combined' in matching_rows.columns:
                             matching_rows = matching_rows.drop(columns=['combined'])
-                        # Add to master
                         master = pd.concat([master, matching_rows], ignore_index=True)
                         results_count += len(matching_rows)
                         print(f"Added {len(matching_rows)} matching rows. Total matches so far: {results_count}")
@@ -1190,7 +1198,7 @@ def equities_second():
                 print(f"Error occurred while processing {zip_file}. Continuing to next file.")
             print(f"Current matches count: {results_count}")
         
-        # If we have processed at least one file, ensure the CSV starts with the first file's headers
+        # Ensure the CSV starts with the first file's headers
         if first_headers:
             master = master.reindex(columns=first_headers, fill_value=None)
         return master, results_count
