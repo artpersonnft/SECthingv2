@@ -10,7 +10,8 @@ From the command line, navigate to the folder containing the script and type: py
 Usage:
 The scraper will auto-install required modules and query for which archives to download.
 
-For analyze.py, install required modules: pip install pandas matplotlib mplcursors yfinance, then run python analyze.py. Select a subdirectory and CSV file, then choose charting options (e.g., date type, aggregation, ticker) to visualize data.
+For analyze.py, install required modules: pip3 install pandas matplotlib mplcursors yfinance
+then run python3 analyze.py. Select a subdirectory and CSV file, then choose charting options (e.g., date type, aggregation, ticker) to visualize data.
 
 Note: Post-download functionality is still rough, but AI can help analyze filings. Explore, poke around, and look things up. Make learning great again! :)
 
