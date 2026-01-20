@@ -6,15 +6,14 @@ from zipfile import ZipFile
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 from urllib.error import HTTPError, URLError
-
-
+from io import TextIOWrapper
+from collections import Counter
 # Native Python modulesss
 native_modules = [
     'csv', 'gc', 'glob', 'hashlib', 'itertools', 'logging', 'os', 're', 'shutil', 
     'sys', 'textwrap', 'threading', 'time', 'urllib.request', 'urllib.error', 'zipfile',
     'datetime', 'queue', 'pathlib'
 ]
-
 # Non-native Python modules for third-party installation
 third_party_modules = [
     'chardet', 'pandas', 'requests', 'bs4', 'tqdm', 'lxml'
@@ -39,7 +38,6 @@ EXCHANGE_SOURCE_DIR = os.path.join(ROOT_DIR, "EXCHANGE")
 INSIDER_SOURCE_DIR = os.path.join(ROOT_DIR, "INSIDERS")
 NCSR_DIR = os.path.join(ROOT_DIR, "NCSR")
 FTD_DIR = os.path.join(ROOT_DIR, "FTD")
-
 directories = [
     INSIDER_SOURCE_DIR,
     EXCHANGE_SOURCE_DIR,
@@ -58,10 +56,8 @@ directories = [
     FORMD_SOURCE_DIR,
     NCSR_DIR,
 ]
-
 for directory in directories:
     os.makedirs(directory, exist_ok=True)
-
 # Setup logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 # List of User-Agent strings for rotation
@@ -968,7 +964,6 @@ def allyourbasearebelongtous():
 
     except Exception as e:
         log_progress(f"An error occurred: {e}")
-
 def download_ftd_filings():
     from datetime import datetime
     from dateutil.relativedelta import relativedelta
@@ -1085,72 +1080,185 @@ def download_ftd_filings():
         exit(1)
 def ftd_second():
     gamecat_ascii()
-
-    def parse_zips_in_batches(search_term, search_column, batch_size=100):
-        master = pd.DataFrame()  # Start with an empty dataframe
-        zip_files = sorted(glob.glob(os.path.join(FTD_DIR, '*.zip')), key=lambda x: os.path.basename(x))
-        total_files = len(zip_files)
-        results_count = 0
-        
-        print(f"\nStarting to process {total_files} zip files...")
-        for i in range(0, total_files, batch_size):
-            batch = zip_files[i:i+batch_size]
-            for index, zip_file in enumerate(batch, 1):
-                print(f"\nProcessing file {i + index}/{total_files}: {zip_file}")
-                try:
-                    with ZipFile(zip_file, 'r') as zip_ref:
-                        csv_filename = zip_ref.namelist()[0]  # Assuming one CSV per zip
-                        print(f"Reading CSV file: {csv_filename}")
-                        with zip_ref.open(csv_filename) as csv_file:
-                            # Try UTF-8 first, fall back to latin1 for decoding errors
-                            try:
-                                df = pd.read_csv(csv_file, sep='|', low_memory=False, on_bad_lines='skip')
-                            except UnicodeDecodeError:
-                                logging.warning(f"UTF-8 decoding failed for {csv_filename}. Trying latin1 encoding.")
-                                csv_file.seek(0)  # Reset file pointer
-                                df = pd.read_csv(csv_file, sep='|', encoding='latin1', low_memory=False, on_bad_lines='skip')
-                            # Verify required columns exist
-                            required_columns = ['SETTLEMENT DATE', 'CUSIP', 'SYMBOL']
-                            if not all(col in df.columns for col in required_columns):
-                                print(f"Skipping {csv_filename}: Missing required columns {required_columns}")
-                                logging.warning(f"File {csv_filename} does not contain all required columns: {df.columns}")
-                                continue
-                            # Search for exact match in the specified column (case-insensitive)
-                            if search_column in df.columns and (df[search_column].str.upper() == search_term.upper()).any():
-                                print(f"Matches found in column: {search_column}")
-                                matching_rows = df[df[search_column].str.upper() == search_term.upper()]
-                                master = pd.concat([master, matching_rows], ignore_index=True)
-                                results_count += len(matching_rows)
-                                print(f"Added {len(matching_rows)} matching rows. Total matches so far: {results_count}")
-                            else:
-                                print(f"No matches found in {csv_filename}")
-                except Exception as e:
-                    logging.error(f"Error processing {zip_file}: {e}")
-                    print(f"Error occurred while processing {zip_file}. Continuing to next file.")
-        return master, results_count
-
+    
+    import csv
+    from io import TextIOWrapper
+    from datetime import datetime
+    
+    def extract_date_from_filename(filename):
+        """Attempt to extract YYYY-MM-DD from common FTD filename patterns, e.g., ftd20241216.zip or similar"""
+        match = re.search(r'(\d{8})', os.path.basename(filename))  # Common 8-digit date
+        if match:
+            date_str = match.group(1)
+            try:
+                return datetime.strptime(date_str, '%Y%m%d').date()
+            except:
+                pass
+        return None
+    
     print("Press Enter when you are ready to parse the files (q to quit):")
     user_input = input()
     if user_input.lower() != 'q':
-        search_column = input("Enter the column to search (C for CUSIP, S for SYMBOL): ").strip().upper()
-        if search_column == 'C':
+        search_column_input = input("Enter the column to search (C for CUSIP, S for SYMBOL): ").strip().upper()
+        if search_column_input == 'C':
             search_column = 'CUSIP'
-        elif search_column == 'S':
+        elif search_column_input == 'S':
             search_column = 'SYMBOL'
         else:
             print("Invalid input. Please enter 'C' or 'S'.")
-            logging.error(f"Invalid column input: {search_column}")
+            logging.error(f"Invalid column input: {search_column_input}")
             return
-        search_term = input(f"Enter the search term for {search_column}: ").strip()
-        master, final_count = parse_zips_in_batches(search_term, search_column)
-        master_csv_path = os.path.join(FTD_DIR, f"filtered_{search_term.replace(' ', '_')}.csv")
-        master.to_csv(master_csv_path, index=False)
-        print(f"\nSaving results to: {master_csv_path}")
-        print(f"Total Matches Found: {final_count}")
-        logging.info(f"Parsing completed. Master file saved as {master_csv_path}")
+        
+        search_term = input(f"Enter the search term for {search_column}: ").strip().upper()  # Upper for case-insensitive compare
+        
+        safe_term = re.sub(r'\W+', '_', search_term)
+        master_csv_path = os.path.join(FTD_DIR, f"filtered_{safe_term}.csv")
+        
+        master = pd.DataFrame()
+        start_from_zip_index = 0
+        max_existing_date = None
+        
+        # Resume logic
+        if os.path.exists(master_csv_path):
+            print(f"Existing output found: {master_csv_path}")
+            resume = input("Resume from existing file? (y/n, default y): ").strip().lower()
+            if resume != 'n':
+                try:
+                    master = pd.read_csv(master_csv_path, low_memory=False, sep='|', dtype=str)
+                    master.fillna('', inplace=True)
+                    print(f"Loaded {len(master)} existing matches.")
+                    
+                    if 'SETTLEMENT DATE' in master.columns:
+                        # Use settlement date for resume skipping (convert to date)
+                        master['SETTLEMENT DATE'] = pd.to_datetime(master['SETTLEMENT DATE'], errors='coerce')
+                        max_existing_date = master['SETTLEMENT DATE'].max()
+                        if pd.notna(max_existing_date):
+                            max_existing_date = max_existing_date.date()
+                            print(f"Latest settlement date in existing results: {max_existing_date}")
+                except Exception as e:
+                    print(f"Could not load existing file ({e}). Starting fresh.")
+                    master = pd.DataFrame()
+        
+        # Get and sort zip files
+        zip_files = sorted(glob.glob(os.path.join(FTD_DIR, '*.zip')),
+                           key=lambda x: os.path.basename(x))
+        total_files = len(zip_files)
+        
+        if total_files == 0:
+            print("No zip files found.")
+            return
+        
+        # Skip old files based on date if resuming
+        if max_existing_date:
+            for i, zf in enumerate(zip_files):
+                zip_date = extract_date_from_filename(zf)
+                if zip_date and zip_date > max_existing_date:
+                    start_from_zip_index = i
+                    break
+            else:
+                print("Existing results are up to date. No new files to process.")
+                return
+        
+        print(f"\nStarting processing from file {start_from_zip_index + 1}/{total_files} onwards...")
+        
+        results_count = len(master)
+        file_schema_counts = {}  # For final summary
+        
+        for index in range(start_from_zip_index, total_files):
+            zip_file = zip_files[index]
+            print(f"\nProcessing file {index + 1}/{total_files}: {zip_file}")
+            matches_in_file = 0
+            file_matching_rows = []
+            
+            try:
+                with ZipFile(zip_file, 'r') as zip_ref:
+                    csv_filename = zip_ref.namelist()[0]
+                    print(f"Reading CSV: {csv_filename}")
+                    with zip_ref.open(csv_filename) as csv_file:
+                        # Try UTF-8 first, then latin1
+                        try:
+                            text_file = TextIOWrapper(csv_file, encoding='utf-8', errors='replace')
+                            reader = csv.reader(text_file, delimiter='|')
+                        except UnicodeDecodeError:
+                            logging.warning(f"UTF-8 failed for {csv_filename}. Falling back to latin1.")
+                            csv_file.seek(0)
+                            text_file = TextIOWrapper(csv_file, encoding='latin1', errors='replace')
+                            reader = csv.reader(text_file, delimiter='|')
+                        
+                        file_headers = next(reader, None)
+                        if not file_headers:
+                            print("No headers found in this file. Skipping.")
+                            continue
+                        
+                        header_count = len(file_headers)
+                        print(f"Detected {header_count} columns in this file.")
+                        file_schema_counts[zip_file] = header_count
+                        
+                        required_columns = ['SETTLEMENT DATE', 'CUSIP', 'SYMBOL']
+                        if not all(col in file_headers for col in required_columns):
+                            print(f"Skipping {csv_filename}: Missing required columns.")
+                            continue
+                        
+                        if search_column not in file_headers:
+                            print(f"Search column {search_column} not found in this file.")
+                            continue
+                        
+                        search_idx = file_headers.index(search_column)
+                        
+                        for row in reader:
+                            # Normalize row length
+                            if len(row) > header_count:
+                                overflow = row[header_count:]
+                                row = row[:header_count-1] + [row[header_count-1] + '|'.join(overflow)]
+                            elif len(row) < header_count:
+                                row += [''] * (header_count - len(row))
+                            
+                            # Exact case-insensitive match
+                            if row[search_idx].strip().upper() == search_term:
+                                file_matching_rows.append(row)
+                                matches_in_file += 1
+                        
+                        if file_matching_rows:
+                            file_df = pd.DataFrame(file_matching_rows, columns=file_headers)
+                            master = pd.concat([master, file_df], ignore_index=True)
+                            results_count += len(file_matching_rows)
+                            
+                            # Interim save
+                            master.to_csv(master_csv_path, index=False, sep='|')
+                            print(f"Interim save: {len(master)} total matches written to {master_csv_path}")
+                        
+                        print(f"Added {matches_in_file} new matches from this file. Current total: {results_count}")
+            except Exception as e:
+                logging.error(f"Error processing {zip_file}: {e}")
+                print(f"Error processing {zip_file}: {e}. Continuing...")
+        
+        if not master.empty:
+            master.fillna('', inplace=True)
+            
+            # Deduplication (keep latest by settlement date if available)
+            if 'SETTLEMENT DATE' in master.columns:
+                master['SETTLEMENT DATE'] = pd.to_datetime(master['SETTLEMENT DATE'], errors='coerce')
+                master.sort_values('SETTLEMENT DATE', ascending=False, inplace=True)
+                master.drop_duplicates(subset=['CUSIP', 'SYMBOL', 'SETTLEMENT DATE'], keep='first', inplace=True)
+            
+            # Final save (pipe-separated to match source)
+            master.to_csv(master_csv_path, index=False, sep='|')
+            print(f"\nFinal save complete: {master_csv_path}")
+            print(f"Total Unique Matches Found: {len(master)}")
+            print(f"Final output has {len(master.columns)} columns (union of all schemas).")
+            
+            # Schema summary
+            from collections import Counter
+            schema_summary = Counter(file_schema_counts.values())
+            print("\nSchema summary across processed files:")
+            for count, freq in sorted(schema_summary.items()):
+                print(f"  {freq} files with {count} columns")
+            
+            logging.info(f"FTD parsing completed. Master file saved as {master_csv_path}")
+        else:
+            print("No matches found.")
     else:
         print("Exiting script.")
-
 def download_credit_archives():
     os.makedirs(CREDIT_SOURCE_DIR, exist_ok=True)
     gamecat_ascii()
@@ -1226,54 +1334,212 @@ def download_credit_archives():
         exit(1)
 def credits_second():
     gamecat_ascii()
-
-    def parse_zips_in_batches(batch_size=100):
-        master = pd.DataFrame()  # Start with an empty dataframe
-        zip_files = sorted(glob.glob(os.path.join(CREDIT_SOURCE_DIR, '*.zip')), key=lambda x: os.path.basename(x))
-        total_files = len(zip_files)
-        results_count = 0
-        
-        print(f"\nStarting to process {total_files} zip files...")
-        for i in range(0, total_files, batch_size):
-            batch = zip_files[i:i+batch_size]
-            for index, zip_file in enumerate(batch, 1):
-                print(f"\nProcessing file {i + index}/{total_files}: {zip_file}")
-                try:
-                    with ZipFile(zip_file, 'r') as zip_ref:
-                        csv_filename = zip_ref.namelist()[0]  # Assuming only one CSV per zip
-                        print(f"Reading CSV file: {csv_filename}")
-                        with zip_ref.open(csv_filename) as csv_file:
-                            df = pd.read_csv(csv_file, low_memory=False)
-                            match_found = False
-                            for column in df.columns:
-                                if column in df.columns and df[column].astype(str).str.contains(search_term, case=False, na=False).any():
-                                    print(f"Matches found in column: {column}")
-                                    matching_rows = df[df[column].astype(str).str.contains(search_term, case=False, na=False)]
-                                    master = pd.concat([master, matching_rows], ignore_index=True)
-                                    results_count += len(matching_rows)
-                                    match_found = True
-                                    print(f"Added {len(matching_rows)} matching rows. Total matches so far: {results_count}")
-                                    break  # We've found a match, no need to check other columns
-                            if not match_found:
-                                print(f"No matches found in {csv_filename}")         
-                except Exception as e:
-                    logging.error(f"Error processing {zip_file}: {e}")
-                    print(f"Error occurred while processing {zip_file}. Continuing to next file.")
-                print(f"Current matches count: {results_count}")
-            
-            # Optionally, save or perform operations on 'master' here if it's getting too large
-        return master, results_count
-
+    
+    import csv
+    from io import TextIOWrapper
+    import re
+    from datetime import datetime
+    
+    def extract_date_from_filename(filename):
+        match = re.search(r'(\d{4}_\d{2}_\d{2})', os.path.basename(filename))
+        if match:
+            date_str = match.group(1).replace('_', '-')
+            try:
+                return datetime.strptime(date_str, '%Y-%m-%d').date()
+            except:
+                pass
+        return None
+    
+    def clean_free_text(value):
+        if not isinstance(value, str):
+            return value
+        cleaned = value.replace('""', '"')
+        cleaned = cleaned.strip('"')
+        return cleaned
+    
     print("Press Enter when you are ready to parse the files, or type 'q' to quit.")
     user_input = input()
     if user_input.lower() != 'q':
         search_term = input("Enter the search term: ").strip()
-        master, final_count = parse_zips_in_batches()
-        master_csv_path = os.path.join(CREDIT_SOURCE_DIR, f"filtered_{search_term.replace(' ', '_')}.csv")
-        master.to_csv(master_csv_path, index=False)
-        print(f"\nSaving results to: {master_csv_path}")
-        print(f"Total Matches Found: {final_count}")
-        logging.info(f"Parsing completed. Master file saved as {master_csv_path}")
+        if not search_term:
+            print("No search term provided. Exiting.")
+            return
+        
+        lower_search_term = search_term.lower()
+        safe_term = re.sub(r'\W+', '_', search_term)
+        master_csv_path = os.path.join(CREDIT_SOURCE_DIR, f"filtered_{safe_term}.csv")
+        
+        master = pd.DataFrame()
+        start_from_zip_index = 0
+        max_existing_date = None
+        
+        # Resume logic
+        if os.path.exists(master_csv_path):
+            print(f"Existing output found: {master_csv_path}")
+            resume = input("Resume from existing file? (y/n, default y): ").strip().lower()
+            if resume != 'n':
+                try:
+                    master = pd.read_csv(master_csv_path, low_memory=False, dtype=str)
+                    master.fillna('', inplace=True)
+                    print(f"Loaded {len(master)} existing matches.")
+                    
+                    # Attempt to find a date column for resume skipping (common: Event timestamp)
+                    date_col = None
+                    for possible in ['Event timestamp', 'Event Timestamp', 'EVENT TIMESTAMP', 'Execution Timestamp']:
+                        if possible in master.columns:
+                            date_col = possible
+                            break
+                    if date_col:
+                        master[date_col] = pd.to_datetime(master[date_col], errors='coerce', utc=True)
+                        max_existing_date = master[date_col].max()
+                        if pd.notna(max_existing_date):
+                            max_existing_date = max_existing_date.date()
+                            print(f"Latest event date in existing results: {max_existing_date}")
+                except Exception as e:
+                    print(f"Could not load existing file ({e}). Starting fresh.")
+                    master = pd.DataFrame()
+        
+        # Get and sort zip files
+        zip_files = sorted(glob.glob(os.path.join(CREDIT_SOURCE_DIR, '*.zip')),
+                           key=lambda x: os.path.basename(x))
+        total_files = len(zip_files)
+        
+        if total_files == 0:
+            print("No zip files found.")
+            return
+        
+        # Skip old files if resuming
+        if max_existing_date:
+            for i, zf in enumerate(zip_files):
+                zip_date = extract_date_from_filename(zf)
+                if zip_date and zip_date > max_existing_date:
+                    start_from_zip_index = i
+                    break
+            else:
+                print("Existing results are up to date. No new files to process.")
+                return
+        
+        print(f"\nStarting processing from file {start_from_zip_index + 1}/{total_files} onwards...")
+        
+        results_count = len(master)
+        file_schema_counts = {}  # For final summary
+        
+        for index in range(start_from_zip_index, total_files):
+            zip_file = zip_files[index]
+            print(f"\nProcessing file {index + 1}/{total_files}: {zip_file}")
+            matches_in_file = 0
+            file_matching_rows = []
+            
+            try:
+                with ZipFile(zip_file, 'r') as zip_ref:
+                    csv_filename = zip_ref.namelist()[0]
+                    print(f"Reading CSV: {csv_filename}")
+                    with zip_ref.open(csv_filename) as csv_file:
+                        text_file = TextIOWrapper(csv_file, encoding='utf-8', errors='replace')
+                        reader = csv.reader(text_file, delimiter=',', quotechar='"')
+                        
+                        file_headers = next(reader, None)
+                        if not file_headers:
+                            print("No headers found in this file. Skipping.")
+                            continue
+                        
+                        header_count = len(file_headers)
+                        print(f"Detected {header_count} columns in this file.")
+                        file_schema_counts[zip_file] = header_count
+                        
+                        last_col_idx = len(file_headers) - 1
+                        
+                        # To match original "first column" logic: check columns in order, stop at first with any match
+                        matching_column_idx = None
+                        temp_rows_for_check = []  # Temporary to scan for first matching column
+                        
+                        for row_num, row in enumerate(reader, start=2):
+                            # Normalize row length
+                            current_cols = len(file_headers)
+                            if len(row) > current_cols:
+                                overflow = row[current_cols:]
+                                row = row[:current_cols-1] + [row[current_cols-1] + ','.join(overflow)]
+                            elif len(row) < current_cols:
+                                row += [''] * (current_cols - len(row))
+                            
+                            # Clean trailing free-text if present
+                            row[last_col_idx] = clean_free_text(row[last_col_idx])
+                            
+                            if matching_column_idx is None:
+                                temp_rows_for_check.append(row)
+                                # Check columns in order for this row
+                                for col_idx, cell in enumerate(row):
+                                    if lower_search_term in str(cell).lower():
+                                        matching_column_idx = col_idx
+                                        print(f"First matches found in column: {file_headers[col_idx]}")
+                                        break
+                            else:
+                                # Already found matching column - check only that column
+                                if lower_search_term in str(row[matching_column_idx]).lower():
+                                    file_matching_rows.append(row[:])
+                                    matches_in_file += 1
+                        
+                        # If no early column match, fall back to full scan on temp rows
+                        if matching_column_idx is None and temp_rows_for_check:
+                            for row in temp_rows_for_check:
+                                row_combined = ' '.join(row).lower()
+                                if lower_search_term in row_combined:
+                                    file_matching_rows.append(row)
+                                    matches_in_file += 1
+                            if matches_in_file > 0:
+                                print("Matches found (full row scan after no early column hit).")
+                        elif matching_column_idx is not None:
+                            # Re-scan temp rows for the matching column
+                            for row in temp_rows_for_check:
+                                if lower_search_term in str(row[matching_column_idx]).lower():
+                                    file_matching_rows.append(row)
+                                    matches_in_file += len([1])  # Already counted in main loop, but adjust if needed
+                        
+                        if file_matching_rows:
+                            file_df = pd.DataFrame(file_matching_rows, columns=file_headers)
+                            master = pd.concat([master, file_df], ignore_index=True)
+                            results_count += len(file_matching_rows)
+                            
+                            # Interim save
+                            master.to_csv(master_csv_path, index=False)
+                            print(f"Interim save: {len(master)} total matches written to {master_csv_path}")
+                        
+                        if matches_in_file == 0:
+                            print("No matches found in this file.")
+                        
+                        print(f"Added {matches_in_file} new matches from this file. Current total: {results_count}")
+            except Exception as e:
+                logging.error(f"Error processing {zip_file}: {e}")
+                print(f"Error processing {zip_file}: {e}. Continuing...")
+        
+        if not master.empty:
+            master.fillna('', inplace=True)
+            
+            # Deduplication - try common key if present
+            if 'Dissemination Identifier' in master.columns:
+                date_col = 'Event timestamp' if 'Event timestamp' in master.columns else master.columns[0]
+                master.sort_values(date_col, ascending=False, inplace=True)
+                master.drop_duplicates(subset=['Dissemination Identifier'], keep='first', inplace=True)
+            
+            # Final column ordering
+            master = master[sorted(master.columns)]
+            
+            # Final save
+            master.to_csv(master_csv_path, index=False)
+            print(f"\nFinal save complete: {master_csv_path}")
+            print(f"Total Unique Matches Found: {len(master)}")
+            print(f"Final output has {len(master.columns)} columns (union of all schemas).")
+            
+            # Schema summary
+            from collections import Counter
+            schema_summary = Counter(file_schema_counts.values())
+            print("\nSchema summary across processed files:")
+            for count, freq in sorted(schema_summary.items()):
+                print(f"  {freq} files with {count} columns")
+            
+            logging.info(f"Credit parsing completed. Master file saved as {master_csv_path}")
+        else:
+            print("No matches found.")
     else:
         print("Exiting script.")
 def download_equities_archives():
@@ -1335,197 +1601,204 @@ def download_equities_archives():
         exit(1)
 def equities_second():
     gamecat_ascii()
-    
-    import csv
-    from io import TextIOWrapper
-    import re
-    from datetime import datetime
-    
+
     def extract_date_from_filename(filename):
         match = re.search(r'(\d{4}_\d{2}_\d{2})', os.path.basename(filename))
         if match:
             date_str = match.group(1).replace('_', '-')
             try:
                 return datetime.strptime(date_str, '%Y-%m-%d').date()
-            except:
-                pass
+            except ValueError:
+                return None
         return None
-    
+
     def clean_underlier(value):
         if not isinstance(value, str):
             return value
         cleaned = value.replace('""', '"')
-        cleaned = cleaned.strip('"')
+        cleaned = cleaned.strip('" \t')
         return cleaned
-    
-    print("Press Enter when you are ready to parse the files, or type 'q' to quit.")
-    user_input = input()
-    if user_input.lower() != 'q':
-        search_terms_input = input("Enter search terms separated by commas: ").strip()
-        search_terms = [term.strip() for term in search_terms_input.split(',') if term.strip()]
-        if not search_terms:
-            print("No search terms provided. Exiting.")
-            return
-        
-        safe_terms = [re.sub(r'\W+', '_', term) for term in search_terms]
-        master_csv_path = os.path.join(EQUITY_SOURCE_DIR, f"filtered_{'_'.join(safe_terms)}.csv")
-        
-        master = pd.DataFrame()
-        start_from_zip_index = 0
-        max_existing_date = None
-        
-        if os.path.exists(master_csv_path):
-            print(f"Existing output found: {master_csv_path}")
-            resume = input("Resume from existing file? (y/n, default y): ").strip().lower()
-            if resume != 'n':
-                try:
-                    master = pd.read_csv(master_csv_path, low_memory=False, dtype=str)
-                    master.fillna('', inplace=True)
-                    print(f"Loaded {len(master)} existing matches.")
-                    
-                    if 'Event timestamp' in master.columns:
-                        master['Event timestamp'] = pd.to_datetime(master['Event timestamp'], errors='coerce', utc=True)
-                        max_existing_date = master['Event timestamp'].max()
-                        if pd.notna(max_existing_date):
-                            max_existing_date = max_existing_date.date()
-                            print(f"Latest event date in existing results: {max_existing_date}")
-                except Exception as e:
-                    print(f"Could not load existing file ({e}). Starting fresh.")
-                    master = pd.DataFrame()
-        
-        zip_files = sorted(glob.glob(os.path.join(EQUITY_SOURCE_DIR, '*.zip')),
-                           key=lambda x: os.path.basename(x))
-        total_files = len(zip_files)
-        
-        if total_files == 0:
-            print("No zip files found.")
-            return
-        
-        if max_existing_date:
-            for i, zf in enumerate(zip_files):
-                zip_date = extract_date_from_filename(zf)
-                if zip_date and zip_date > max_existing_date:
-                    start_from_zip_index = i
-                    break
-            else:
-                print("Existing results are up to date. No new files to process.")
-                return
-        
-        print(f"\nStarting processing from file {start_from_zip_index + 1}/{total_files} onwards...")
-        
-        results_count = len(master)
-        term_info = [(term, term.strip('"').lower() if term.startswith('"') and term.endswith('"') else term.lower(),
-                      term.startswith('"') and term.endswith('"')) for term in search_terms]
-        loose_needed = any(not is_quoted for _, _, is_quoted in term_info)
-        
-        file_schema_counts = {}  # Track header counts per file for final summary
-        
-        for index in range(start_from_zip_index, total_files):
-            zip_file = zip_files[index]
-            print(f"\nProcessing file {index + 1}/{total_files}: {zip_file}")
-            matches_in_file = 0
-            file_matching_rows = []
-            
+
+    print("Press Enter when ready to parse files, or type 'q' to quit.")
+    user_input = input().strip()
+    if user_input.lower() == 'q':
+        print("Exiting script.")
+        return
+
+    search_terms_input = input("Enter search terms separated by commas: ").strip()
+    search_terms = [t.strip() for t in search_terms_input.split(',') if t.strip()]
+    if not search_terms:
+        print("No search terms provided. Exiting.")
+        return
+
+    safe_terms = [re.sub(r'\W+', '_', term) for term in search_terms]
+    master_csv_path = os.path.join(EQUITY_SOURCE_DIR, f"filtered_{'_'.join(safe_terms)}.csv")
+
+    master = pd.DataFrame()
+    start_from_zip_index = 0
+    max_existing_date = None
+
+    if os.path.exists(master_csv_path):
+        print(f"Existing output found: {master_csv_path}")
+        resume = input("Resume from existing file? (y/n, default y): ").strip().lower()
+        if resume != 'n':
             try:
-                with ZipFile(zip_file, 'r') as zip_ref:
-                    csv_filename = zip_ref.namelist()[0]
-                    print(f"Reading CSV: {csv_filename}")
-                    with zip_ref.open(csv_filename) as csv_file:
-                        text_file = TextIOWrapper(csv_file, encoding='utf-8', errors='replace')
-                        reader = csv.reader(text_file, delimiter=',', quotechar='"')
-                        
-                        file_headers = next(reader, None)
-                        if not file_headers:
-                            print("No headers found in this file. Skipping.")
-                            continue
-                        
-                        header_count = len(file_headers)
-                        print(f"Detected {header_count} columns in this file.")
-                        file_schema_counts[zip_file] = header_count
-                        
-                        if 'Product name' not in file_headers:
-                            print("Required column 'Product name' missing in this file. Skipping.")
-                            continue
-                        
-                        product_name_idx = file_headers.index('Product name')
-                        last_col_idx = len(file_headers) - 1
-                        
-                        for row_num, row in enumerate(reader, start=2):
-                            current_cols = len(file_headers)
-                            if len(row) > current_cols:
-                                overflow = row[current_cols:]
-                                row = row[:current_cols-1] + [row[current_cols-1] + ','.join(overflow)]
-                            elif len(row) < current_cols:
-                                row += [''] * (current_cols - len(row))
-                            
-                            row[last_col_idx] = clean_underlier(row[last_col_idx])
-                            
-                            row_combined_lower = None
-                            if loose_needed:
-                                row_combined_lower = ' '.join(row).lower()
-                            
-                            product_name = row[product_name_idx]
-                            
-                            matching_terms = []
-                            for orig_term, clean_term, is_quoted in term_info:
-                                if is_quoted:
-                                    if re.search(fr'\b{re.escape(clean_term)}\b', product_name, re.IGNORECASE):
-                                        matching_terms.append(orig_term)
-                                else:
-                                    if clean_term in row_combined_lower:
-                                        matching_terms.append(orig_term)
-                            
-                            if matching_terms:
-                                for term in matching_terms:
-                                    extended_row = row[:] + [term]
-                                    file_matching_rows.append(extended_row)
-                                matches_in_file += len(matching_terms)
-                        
-                        if file_matching_rows:
-                            file_df = pd.DataFrame(file_matching_rows, columns=file_headers + ['SearchTerm'])
-                            master = pd.concat([master, file_df], ignore_index=True)
-                            results_count += len(file_matching_rows)
-                            
-                            # Interim save after each file with matches
-                            master.to_csv(master_csv_path, index=False)
-                            print(f"Interim save: {len(master)} total matches written to {master_csv_path}")
-                        
-                        print(f"Added {matches_in_file} new matches from this file. Current total: {results_count}")
+                master = pd.read_csv(master_csv_path, low_memory=False, dtype=str)
+                master.fillna('', inplace=True)
+                print(f"Loaded {len(master)} existing matches.")
+
+                if 'Event timestamp' in master.columns:
+                    master['Event timestamp'] = pd.to_datetime(master['Event timestamp'], errors='coerce', utc=True)
+                    max_existing_date = master['Event timestamp'].max()
+                    if pd.notna(max_existing_date):
+                        max_existing_date = max_existing_date.date()
+                        print(f"Latest event date in existing results: {max_existing_date}")
             except Exception as e:
-                logging.error(f"Error processing {zip_file}: {e}")
-                print(f"Error processing {zip_file}: {e}. Continuing...")
-        
-        if not master.empty:
-            master.fillna('', inplace=True)
-            
-            # Final deduplication and sorting
-            if 'Dissemination Identifier' in master.columns:
-                master.sort_values('Event timestamp' if 'Event timestamp' in master.columns else master.columns[0], ascending=False, inplace=True)
-                master.drop_duplicates(subset=['Dissemination Identifier', 'SearchTerm'], keep='first', inplace=True)
-            
-            # Final column ordering
-            search_term_col = master.pop('SearchTerm') if 'SearchTerm' in master.columns else None
+                print(f"Could not load existing file ({e}). Starting fresh.")
+                master = pd.DataFrame()
+
+    zip_files = sorted(glob.glob(os.path.join(EQUITY_SOURCE_DIR, '*.zip')),
+                       key=os.path.basename)
+    total_files = len(zip_files)
+
+    if total_files == 0:
+        print("No zip files found.")
+        return
+
+    if max_existing_date:
+        for i, zf in enumerate(zip_files):
+            zip_date = extract_date_from_filename(zf)
+            if zip_date and zip_date > max_existing_date:
+                start_from_zip_index = i
+                break
+        else:
+            print("Existing results are up to date. No new files to process.")
+            print(f"Total matches: {len(master)}")
+            return
+
+    max_workers = os.cpu_count() or 8
+    print(f"\nProcessing {total_files - start_from_zip_index} file(s) starting from index {start_from_zip_index + 1}...")
+    print(f"Using {max_workers} worker threads (detected CPU count)...")
+
+    term_info = [
+        (term,
+         term.strip('"').lower() if term.startswith('"') and term.endswith('"') else term.lower(),
+         term.startswith('"') and term.endswith('"'))
+        for term in search_terms
+    ]
+    loose_needed = any(not is_quoted for _, _, is_quoted in term_info)
+    file_schema_counts = {}
+
+    def process_zip(zip_path):
+        local_matches = []
+        local_headers = None
+        matches_in_file = 0
+
+        try:
+            with ZipFile(zip_path, 'r') as zip_ref:
+                csv_filename = zip_ref.namelist()[0]
+                with zip_ref.open(csv_filename) as csv_file:
+                    text_file = TextIOWrapper(csv_file, encoding='utf-8', errors='replace')
+                    reader = csv.reader(text_file, delimiter=',', quotechar='"')
+
+                    file_headers = next(reader, None)
+                    if not file_headers:
+                        return [], None, 0
+
+                    header_count = len(file_headers)
+                    file_schema_counts[os.path.basename(zip_path)] = header_count
+
+                    if 'Product name' not in file_headers:
+                        return [], None, 0
+
+                    product_name_idx = file_headers.index('Product name')
+                    last_col_idx = len(file_headers) - 1
+
+                    for row in reader:
+                        current_cols = len(file_headers)
+                        if len(row) > current_cols:
+                            overflow = row[current_cols:]
+                            row = row[:current_cols-1] + [row[current_cols-1] + ','.join(overflow)]
+                        elif len(row) < current_cols:
+                            row += [''] * (current_cols - len(row))
+
+                        if last_col_idx < len(row):
+                            row[last_col_idx] = clean_underlier(row[last_col_idx])
+
+                        row_combined_lower = ' '.join(row).lower() if loose_needed else None
+                        product_name = row[product_name_idx] if product_name_idx < len(row) else ""
+
+                        matching_terms = []
+                        for orig_term, clean_term, is_quoted in term_info:
+                            if is_quoted:
+                                if re.search(fr'\b{re.escape(clean_term)}\b', product_name, re.IGNORECASE):
+                                    matching_terms.append(orig_term)
+                            else:
+                                if row_combined_lower and clean_term in row_combined_lower:
+                                    matching_terms.append(orig_term)
+
+                        if matching_terms:
+                            for term in matching_terms:
+                                extended_row = row[:] + [term]
+                                local_matches.append(extended_row)
+                            matches_in_file += len(matching_terms)
+
+            return local_matches, file_headers, matches_in_file
+
+        except Exception as e:
+            logging.error(f"Error processing {zip_path}: {e}")
+            print(f"Error processing {os.path.basename(zip_path)}: {e}")
+            return [], None, 0
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_zip = {
+            executor.submit(process_zip, zip_files[i]): zip_files[i]
+            for i in range(start_from_zip_index, total_files)
+        }
+
+        for future in as_completed(future_to_zip):
+            zip_file = future_to_zip[future]
+            try:
+                file_matches, headers, count = future.result()
+                if file_matches and headers:
+                    file_df = pd.DataFrame(file_matches, columns=headers + ['SearchTerm'])
+                    master = pd.concat([master, file_df], ignore_index=True)
+
+                    # Interim save
+                    master.to_csv(master_csv_path, index=False)
+                    print(f"Processed: {os.path.basename(zip_file)} | Added {count} matches | Total now: {len(master)}")
+                    print(f"   Interim save → {master_csv_path}")
+
+            except Exception as e:
+                print(f"Exception processing {os.path.basename(zip_file)}: {e}")
+
+    if not master.empty:
+        master.fillna('', inplace=True)
+
+        if 'Dissemination Identifier' in master.columns:
+            sort_col = 'Event timestamp' if 'Event timestamp' in master.columns else master.columns[0]
+            master.sort_values(sort_col, ascending=False, inplace=True)
+            master.drop_duplicates(subset=['Dissemination Identifier', 'SearchTerm'], keep='first', inplace=True)
+
+        if 'SearchTerm' in master.columns:
+            search_col = master.pop('SearchTerm')
             master = master[sorted(master.columns)]
-            if search_term_col is not None:
-                master['SearchTerm'] = search_term_col
-            
-            # Final save (overwrites interim with cleaned version)
-            master.to_csv(master_csv_path, index=False)
-            print(f"\nFinal save complete: {master_csv_path}")
-            print(f"Total Unique Matches Found: {len(master)}")
-            print(f"Final output has {len(master.columns)} columns (union of all schemas).")
-            
-            # Schema summary
-            from collections import Counter
+            master['SearchTerm'] = search_col
+
+        master.to_csv(master_csv_path, index=False)
+        print(f"\nFinal save complete: {master_csv_path}")
+        print(f"Total Unique Matches Found: {len(master)}")
+        print(f"Final output has {len(master.columns)} columns (union of all schemas).")
+
+        if file_schema_counts:
             schema_summary = Counter(file_schema_counts.values())
             print("\nSchema summary across processed files:")
             for count, freq in sorted(schema_summary.items()):
                 print(f"  {freq} files with {count} columns")
-            logging.info(f"Parsing completed. Master file saved as {master_csv_path}")
-        else:
-            print("No matches found.")
+
+        logging.info(f"Parsing completed. Master file saved as {master_csv_path}")
     else:
-        print("Exiting script.")
+        print("No matches found.")
 def download_cftc_credit_archives():
     os.makedirs(CFTC_CREDIT_SOURCE_DIR, exist_ok=True)
     gamecat_ascii()
@@ -1600,54 +1873,210 @@ def download_cftc_credit_archives():
         exit(1)
 def CFTC_credits_second():
     gamecat_ascii()
-
-    def parse_zips_in_batches(batch_size=100):
-        master = pd.DataFrame()  # Start with an empty dataframe
-        zip_files = sorted(glob.glob(os.path.join(CFTC_CREDIT_SOURCE_DIR, '*.zip')), key=lambda x: os.path.basename(x))
-        total_files = len(zip_files)
-        results_count = 0
-        
-        print(f"\nStarting to process {total_files} zip files...")
-        for i in range(0, total_files, batch_size):
-            batch = zip_files[i:i+batch_size]
-            for index, zip_file in enumerate(batch, 1):
-                print(f"\nProcessing file {i + index}/{total_files}: {zip_file}")
-                try:
-                    with ZipFile(zip_file, 'r') as zip_ref:
-                        csv_filename = zip_ref.namelist()[0]  # Assuming only one CSV per zip
-                        print(f"Reading CSV file: {csv_filename}")
-                        with zip_ref.open(csv_filename) as csv_file:
-                            df = pd.read_csv(csv_file, low_memory=False)
-                            match_found = False
-                            for column in df.columns:
-                                if column in df.columns and df[column].astype(str).str.contains(search_term, case=False, na=False).any():
-                                    print(f"Matches found in column: {column}")
-                                    matching_rows = df[df[column].astype(str).str.contains(search_term, case=False, na=False)]
-                                    master = pd.concat([master, matching_rows], ignore_index=True)
-                                    results_count += len(matching_rows)
-                                    match_found = True
-                                    print(f"Added {len(matching_rows)} matching rows. Total matches so far: {results_count}")
-                                    break  # We've found a match, no need to check other columns
-                            if not match_found:
-                                print(f"No matches found in {csv_filename}")         
-                except Exception as e:
-                    logging.error(f"Error processing {zip_file}: {e}")
-                    print(f"Error occurred while processing {zip_file}. Continuing to next file.")
-                print(f"Current matches count: {results_count}")
-            
-            # Optionally, save or perform operations on 'master' here if it's getting too large
-        return master, results_count
-
+    
+    import csv
+    from io import TextIOWrapper
+    import re
+    from datetime import datetime
+    
+    def extract_date_from_filename(filename):
+        match = re.search(r'(\d{4}_\d{2}_\d{2})', os.path.basename(filename))
+        if match:
+            date_str = match.group(1).replace('_', '-')
+            try:
+                return datetime.strptime(date_str, '%Y-%m-%d').date()
+            except:
+                pass
+        return None
+    
+    def clean_free_text(value):
+        if not isinstance(value, str):
+            return value
+        cleaned = value.replace('""', '"')
+        cleaned = cleaned.strip('"')
+        return cleaned
+    
     print("Press Enter when you are ready to parse the files, or type 'q' to quit.")
     user_input = input()
     if user_input.lower() != 'q':
         search_term = input("Enter the search term: ").strip()
-        master, final_count = parse_zips_in_batches()
-        master_csv_path = os.path.join(CFTC_CREDIT_SOURCE_DIR, f"filtered_{search_term.replace(' ', '_')}.csv")
-        master.to_csv(master_csv_path, index=False)
-        print(f"\nSaving results to: {master_csv_path}")
-        print(f"Total Matches Found: {final_count}")
-        logging.info(f"Parsing completed. Master file saved as {master_csv_path}")
+        if not search_term:
+            print("No search term provided. Exiting.")
+            return
+        
+        lower_search_term = search_term.lower()
+        safe_term = re.sub(r'\W+', '_', search_term)
+        master_csv_path = os.path.join(CFTC_CREDIT_SOURCE_DIR, f"filtered_{safe_term}.csv")
+        
+        master = pd.DataFrame()
+        start_from_zip_index = 0
+        max_existing_date = None
+        
+        # Resume logic
+        if os.path.exists(master_csv_path):
+            print(f"Existing output found: {master_csv_path}")
+            resume = input("Resume from existing file? (y/n, default y): ").strip().lower()
+            if resume != 'n':
+                try:
+                    master = pd.read_csv(master_csv_path, low_memory=False, dtype=str)
+                    master.fillna('', inplace=True)
+                    print(f"Loaded {len(master)} existing matches.")
+                    
+                    # Look for common date column (Event timestamp typical in CFTC)
+                    date_col = None
+                    for possible in ['Event timestamp', 'Event Timestamp', 'EVENT TIMESTAMP', 'Execution Timestamp', 'Timestamp']:
+                        if possible in master.columns:
+                            date_col = possible
+                            break
+                    if date_col:
+                        master[date_col] = pd.to_datetime(master[date_col], errors='coerce', utc=True)
+                        max_existing_date = master[date_col].max()
+                        if pd.notna(max_existing_date):
+                            max_existing_date = max_existing_date.date()
+                            print(f"Latest event date in existing results: {max_existing_date}")
+                except Exception as e:
+                    print(f"Could not load existing file ({e}). Starting fresh.")
+                    master = pd.DataFrame()
+        
+        # Get and sort zip files
+        zip_files = sorted(glob.glob(os.path.join(CFTC_CREDIT_SOURCE_DIR, '*.zip')),
+                           key=lambda x: os.path.basename(x))
+        total_files = len(zip_files)
+        
+        if total_files == 0:
+            print("No zip files found.")
+            return
+        
+        # Skip old files if resuming
+        if max_existing_date:
+            for i, zf in enumerate(zip_files):
+                zip_date = extract_date_from_filename(zf)
+                if zip_date and zip_date > max_existing_date:
+                    start_from_zip_index = i
+                    break
+            else:
+                print("Existing results are up to date. No new files to process.")
+                return
+        
+        print(f"\nStarting processing from file {start_from_zip_index + 1}/{total_files} onwards...")
+        
+        results_count = len(master)
+        file_schema_counts = {}  # For final summary
+        
+        for index in range(start_from_zip_index, total_files):
+            zip_file = zip_files[index]
+            print(f"\nProcessing file {index + 1}/{total_files}: {zip_file}")
+            matches_in_file = 0
+            file_matching_rows = []
+            
+            try:
+                with ZipFile(zip_file, 'r') as zip_ref:
+                    csv_filename = zip_ref.namelist()[0]
+                    print(f"Reading CSV: {csv_filename}")
+                    with zip_ref.open(csv_filename) as csv_file:
+                        text_file = TextIOWrapper(csv_file, encoding='utf-8', errors='replace')
+                        reader = csv.reader(text_file, delimiter=',', quotechar='"')
+                        
+                        file_headers = next(reader, None)
+                        if not file_headers:
+                            print("No headers found in this file. Skipping.")
+                            continue
+                        
+                        header_count = len(file_headers)
+                        print(f"Detected {header_count} columns in this file.")
+                        file_schema_counts[zip_file] = header_count
+                        
+                        last_col_idx = len(file_headers) - 1
+                        
+                        # First-match column detection + collection
+                        matching_column_idx = None
+                        temp_rows_for_check = []
+                        
+                        for row_num, row in enumerate(reader, start=2):
+                            # Normalize row length
+                            current_cols = len(file_headers)
+                            if len(row) > current_cols:
+                                overflow = row[current_cols:]
+                                row = row[:current_cols-1] + [row[current_cols-1] + ','.join(overflow)]
+                            elif len(row) < current_cols:
+                                row += [''] * (current_cols - len(row))
+                            
+                            # Clean trailing free-text
+                            row[last_col_idx] = clean_free_text(row[last_col_idx])
+                            
+                            if matching_column_idx is None:
+                                temp_rows_for_check.append(row)
+                                for col_idx, cell in enumerate(row):
+                                    if lower_search_term in str(cell).lower():
+                                        matching_column_idx = col_idx
+                                        print(f"First matches found in column: {file_headers[col_idx]}")
+                                        break
+                            else:
+                                if lower_search_term in str(row[matching_column_idx]).lower():
+                                    file_matching_rows.append(row[:])
+                                    matches_in_file += 1
+                        
+                        # Handle temp rows (early rows scanned for column detection)
+                        if matching_column_idx is not None:
+                            for row in temp_rows_for_check:
+                                if lower_search_term in str(row[matching_column_idx]).lower():
+                                    file_matching_rows.append(row)
+                                    matches_in_file += 1
+                        else:
+                            # No column hit - full row scan fallback
+                            for row in temp_rows_for_check:
+                                row_combined = ' '.join(row).lower()
+                                if lower_search_term in row_combined:
+                                    file_matching_rows.append(row)
+                                    matches_in_file += 1
+                            if matches_in_file > 0:
+                                print("Matches found (full row scan after no early column hit).")
+                        
+                        if file_matching_rows:
+                            file_df = pd.DataFrame(file_matching_rows, columns=file_headers)
+                            master = pd.concat([master, file_df], ignore_index=True)
+                            results_count += len(file_matching_rows)
+                            
+                            # Interim save
+                            master.to_csv(master_csv_path, index=False)
+                            print(f"Interim save: {len(master)} total matches written to {master_csv_path}")
+                        
+                        if matches_in_file == 0:
+                            print("No matches found in this file.")
+                        
+                        print(f"Added {matches_in_file} new matches from this file. Current total: {results_count}")
+            except Exception as e:
+                logging.error(f"Error processing {zip_file}: {e}")
+                print(f"Error processing {zip_file}: {e}. Continuing...")
+        
+        if not master.empty:
+            master.fillna('', inplace=True)
+            
+            # Deduplication (common in CFTC: Dissemination Identifier)
+            if 'Dissemination Identifier' in master.columns:
+                date_col = 'Event timestamp' if 'Event timestamp' in master.columns else master.columns[0]
+                master.sort_values(date_col, ascending=False, inplace=True)
+                master.drop_duplicates(subset=['Dissemination Identifier'], keep='first', inplace=True)
+            
+            # Final column ordering
+            master = master[sorted(master.columns)]
+            
+            # Final save
+            master.to_csv(master_csv_path, index=False)
+            print(f"\nFinal save complete: {master_csv_path}")
+            print(f"Total Unique Matches Found: {len(master)}")
+            print(f"Final output has {len(master.columns)} columns (union of all schemas).")
+            
+            # Schema summary
+            from collections import Counter
+            schema_summary = Counter(file_schema_counts.values())
+            print("\nSchema summary across processed files:")
+            for count, freq in sorted(schema_summary.items()):
+                print(f"  {freq} files with {count} columns")
+            
+            logging.info(f"CFTC Credit parsing completed. Master file saved as {master_csv_path}")
+        else:
+            print("No matches found.")
     else:
         print("Exiting script.")
 def download_cftc_commodities_archives():
@@ -1833,63 +2262,167 @@ def download_cftc_rates_archives():
 def cftc_rates_second():
     gamecat_ascii()
 
-    def process_zip(zip_file):
-        results = []
-        try:
-            with ZipFile(zip_file, 'r') as zip_ref:
-                csv_filename = zip_ref.namelist()[0]  # Assuming only one CSV per zip
-                with zip_ref.open(csv_filename) as csv_file:
-                    df = pd.read_csv(csv_file, low_memory=False)
-                    for column in df.columns:
-                        if column in df.columns and df[column].astype(str).str.contains(search_term, case=False, na=False).any():
-                            matching_rows = df[df[column].astype(str).str.contains(search_term, case=False, na=False)]
-                            results.extend(matching_rows.to_dict('records'))  # Convert matching rows to list of dicts
-                            break  # We've found a match, no need to check other columns
-        except Exception as e:
-            logging.error(f"Error processing {zip_file}: {e}")
-        return results
+    def extract_date_from_filename(filename):
+        match = re.search(r'(\d{4}_\d{2}_\d{2})', os.path.basename(filename))
+        if match:
+            date_str = match.group(1).replace('_', '-')
+            try:
+                return datetime.strptime(date_str, '%Y-%m-%d').date()
+            except ValueError:
+                return None
+        return None
 
-    def write_to_csv(results, csv_writer):
-        for row in results:
-            csv_writer.writerow(row)
-
-    # Main execution
-    print("Press Enter when you are ready to parse the files, or type 'q' to quit.")
-    user_input = input()
-    if user_input.lower() != 'q':
-        search_term = input("Enter the search term: ").strip()
-        zip_files = sorted(glob.glob(os.path.join(CFTC_RATES_SOURCE_DIR, '*.zip')), key=lambda x: os.path.basename(x))
-        total_files = len(zip_files)
-        print(f"\nStarting to process {total_files} zip files with 7 worker threads...")
-
-        master_csv_path = os.path.join(CFTC_RATES_SOURCE_DIR, f"filtered_{search_term.replace(' ', '_')}.csv")
-        
-        with open(master_csv_path, 'w', newline='') as csvfile:
-            csv_writer = csv.DictWriter(csvfile, fieldnames=None)  # We'll define fieldnames later
-            header_written = False
-
-            with ThreadPoolExecutor(max_workers=7) as executor:
-                # Process zip files
-                future_to_zip = {executor.submit(process_zip, zip_file): zip_file for zip_file in zip_files}
-                
-                for future in as_completed(future_to_zip):
-                    zip_file = future_to_zip[future]
-                    try:
-                        results = future.result()
-                        if results and not header_written:
-                            # Write header only once
-                            csv_writer.fieldnames = results[0].keys()
-                            csv_writer.writeheader()
-                            header_written = True
-                        write_to_csv(results, csv_writer)
-                        print(f"Processed: {zip_file}")
-                    except Exception as e:
-                        print(f"Exception in {zip_file}: {e}")
-            
-            print(f"\nSaving results to: {master_csv_path}")
-        logging.info(f"Parsing completed. Master file saved as {master_csv_path}")
-    else:
+    print("Press Enter when ready to parse files, or type 'q' to quit.")
+    user_input = input().strip()
+    if user_input.lower() == 'q':
         print("Exiting script.")
+        return
+
+    search_term = input("Enter the search term: ").strip()
+    if not search_term:
+        print("No search term provided. Exiting.")
+        return
+
+    safe_term = re.sub(r'\W+', '_', search_term)
+    master_csv_path = os.path.join(CFTC_RATES_SOURCE_DIR, f"filtered_{safe_term}.csv")
+
+    master = pd.DataFrame()
+    start_from_zip_index = 0
+    max_existing_date = None
+
+    if os.path.exists(master_csv_path):
+        print(f"Found existing output: {master_csv_path}")
+        resume = input("Resume from existing file? (y/n, default y): ").strip().lower()
+        if resume != 'n':
+            try:
+                master = pd.read_csv(master_csv_path, low_memory=False, dtype=str)
+                master.fillna('', inplace=True)
+                print(f"Loaded {len(master)} existing matches.")
+
+                if 'Event timestamp' in master.columns:
+                    master['Event timestamp'] = pd.to_datetime(master['Event timestamp'], errors='coerce', utc=True)
+                    max_existing_date = master['Event timestamp'].max()
+                    if pd.notna(max_existing_date):
+                        max_existing_date = max_existing_date.date()
+                        print(f"Latest event date in existing data: {max_existing_date}")
+            except Exception as e:
+                print(f"Failed to load existing file ({e}). Starting fresh.")
+                master = pd.DataFrame()
+
+    zip_files = sorted(glob.glob(os.path.join(CFTC_RATES_SOURCE_DIR, '*.zip')),
+                       key=os.path.basename)
+    total_files = len(zip_files)
+
+    if total_files == 0:
+        print("No .zip files found in directory.")
+        return
+
+    if max_existing_date:
+        for i, zf in enumerate(zip_files):
+            zip_date = extract_date_from_filename(zf)
+            if zip_date and zip_date > max_existing_date:
+                start_from_zip_index = i
+                break
+        else:
+            print("Existing results appear up-to-date. No new files to process.")
+            print(f"Total matches: {len(master)}")
+            return
+
+    max_workers = os.cpu_count() or 4
+    print(f"\nProcessing {total_files - start_from_zip_index} file(s) starting from index {start_from_zip_index + 1}...")
+    print(f"Using {max_workers} worker threads (detected CPU count)...")
+
+    search_term_lower = search_term.lower()
+    file_column_counts = {}
+
+    def process_zip(zip_path):
+        local_matches = []
+        local_headers = None
+        added = 0
+
+        try:
+            with ZipFile(zip_path, 'r') as z:
+                csv_name = z.namelist()[0]
+                with z.open(csv_name) as csv_raw:
+                    text_stream = TextIOWrapper(csv_raw, encoding='utf-8', errors='replace')
+                    reader = csv.reader(text_stream, delimiter=',', quotechar='"')
+
+                    headers = next(reader, None)
+                    if not headers:
+                        return [], None, 0
+
+                    n_cols = len(headers)
+                    local_headers = headers
+                    file_column_counts[os.path.basename(zip_path)] = n_cols
+
+                    if 'Product name' not in headers:
+                        return [], None, 0
+
+                    prod_name_idx = headers.index('Product name')
+
+                    for row in reader:
+                        if len(row) < n_cols:
+                            row += [''] * (n_cols - len(row))
+                        elif len(row) > n_cols:
+                            overflow = row[n_cols-1:]
+                            row = row[:n_cols-1] + [','.join(overflow)]
+
+                        product_name = row[prod_name_idx] if prod_name_idx < len(row) else ""
+                        if search_term_lower in product_name.lower():
+                            local_matches.append(row + [search_term])
+                            added += 1
+
+            return local_matches, local_headers, added
+
+        except Exception as e:
+            logging.error(f"Error processing {zip_path}: {e}")
+            return [], None, 0
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_zip = {
+            executor.submit(process_zip, zip_file): zip_file
+            for zip_file in zip_files[start_from_zip_index:]
+        }
+
+        for future in as_completed(future_to_zip):
+            zip_file = future_to_zip[future]
+            try:
+                matches, headers, count = future.result()
+                if matches and headers:
+                    df_new = pd.DataFrame(matches, columns=headers + ['SearchTerm'])
+                    master = pd.concat([master, df_new], ignore_index=True)
+                    master.to_csv(master_csv_path, index=False)
+                    print(f"Processed: {os.path.basename(zip_file)} | Added {count} matches | Total: {len(master)}")
+                    print(f"   Interim save → {master_csv_path}")
+            except Exception as e:
+                print(f"Exception in {os.path.basename(zip_file)}: {e}")
+
+    if not master.empty:
+        master.fillna('', inplace=True)
+        if 'Dissemination Identifier' in master.columns:
+            sort_col = 'Event timestamp' if 'Event timestamp' in master.columns else master.columns[0]
+            master.sort_values(sort_col, ascending=False, inplace=True)
+            master.drop_duplicates(subset=['Dissemination Identifier', 'SearchTerm'], keep='first', inplace=True)
+
+        if 'SearchTerm' in master.columns:
+            search_col = master.pop('SearchTerm')
+            master = master[sorted(master.columns)]
+            master['SearchTerm'] = search_col
+
+        master.to_csv(master_csv_path, index=False)
+        print(f"\nDone! Final file saved: {master_csv_path}")
+        print(f"Total unique matches: {len(master)}")
+        print(f"Final column count: {len(master.columns)}")
+
+        if file_column_counts:
+            cnt = Counter(file_column_counts.values())
+            print("\nColumn count summary across processed files:")
+            for ncols, freq in sorted(cnt.items()):
+                print(f"  {freq} files with {ncols} columns")
+
+        logging.info(f"Completed. Saved {len(master)} matches to {master_csv_path}")
+    else:
+        print("\nNo matches found.")
 def download_cftc_equities_archives():
     os.makedirs(CFTC_EQUITY_SOURCE_DIR, exist_ok=True)
 
@@ -1950,63 +2483,167 @@ def download_cftc_equities_archives():
 def cftc_equities_second():
     gamecat_ascii()
 
-    def process_zip(zip_file):
-        results = []
-        try:
-            with ZipFile(zip_file, 'r') as zip_ref:
-                csv_filename = zip_ref.namelist()[0]  # Assuming only one CSV per zip
-                with zip_ref.open(csv_filename) as csv_file:
-                    df = pd.read_csv(csv_file, low_memory=False)
-                    for column in df.columns:
-                        if column in df.columns and df[column].astype(str).str.contains(search_term, case=False, na=False).any():
-                            matching_rows = df[df[column].astype(str).str.contains(search_term, case=False, na=False)]
-                            results.extend(matching_rows.to_dict('records'))  # Convert matching rows to list of dicts
-                            break  # We've found a match, no need to check other columns
-        except Exception as e:
-            logging.error(f"Error processing {zip_file}: {e}")
-        return results
+    def extract_date_from_filename(filename):
+        match = re.search(r'(\d{4}_\d{2}_\d{2})', os.path.basename(filename))
+        if match:
+            date_str = match.group(1).replace('_', '-')
+            try:
+                return datetime.strptime(date_str, '%Y-%m-%d').date()
+            except ValueError:
+                return None
+        return None
 
-    def write_to_csv(results, csv_writer):
-        for row in results:
-            csv_writer.writerow(row)
-
-    # Main execution
-    print("Press Enter when you are ready to parse the files, or type 'q' to quit.")
-    user_input = input()
-    if user_input.lower() != 'q':
-        search_term = input("Enter the search term: ").strip()
-        zip_files = sorted(glob.glob(os.path.join(CFTC_EQUITY_SOURCE_DIR, '*.zip')), key=lambda x: os.path.basename(x))
-        total_files = len(zip_files)
-        print(f"\nStarting to process {total_files} zip files with 7 worker threads...")
-
-        master_csv_path = os.path.join(CFTC_EQUITY_SOURCE_DIR, f"filtered_{search_term.replace(' ', '_')}.csv")
-        
-        with open(master_csv_path, 'w', newline='') as csvfile:
-            csv_writer = csv.DictWriter(csvfile, fieldnames=None)  # We'll define fieldnames later
-            header_written = False
-
-            with ThreadPoolExecutor(max_workers=7) as executor:
-                # Process zip files
-                future_to_zip = {executor.submit(process_zip, zip_file): zip_file for zip_file in zip_files}
-                
-                for future in as_completed(future_to_zip):
-                    zip_file = future_to_zip[future]
-                    try:
-                        results = future.result()
-                        if results and not header_written:
-                            # Write header only once
-                            csv_writer.fieldnames = results[0].keys()
-                            csv_writer.writeheader()
-                            header_written = True
-                        write_to_csv(results, csv_writer)
-                        print(f"Processed: {zip_file}")
-                    except Exception as e:
-                        print(f"Exception in {zip_file}: {e}")
-            
-            print(f"\nSaving results to: {master_csv_path}")
-        logging.info(f"Parsing completed. Master file saved as {master_csv_path}")
-    else:
+    print("Press Enter when ready to parse files, or type 'q' to quit.")
+    user_input = input().strip()
+    if user_input.lower() == 'q':
         print("Exiting script.")
+        return
+
+    search_term = input("Enter the search term: ").strip()
+    if not search_term:
+        print("No search term provided. Exiting.")
+        return
+
+    safe_term = re.sub(r'\W+', '_', search_term)
+    master_csv_path = os.path.join(CFTC_EQUITY_SOURCE_DIR, f"filtered_{safe_term}.csv")
+
+    master = pd.DataFrame()
+    start_from_zip_index = 0
+    max_existing_date = None
+
+    if os.path.exists(master_csv_path):
+        print(f"Found existing output: {master_csv_path}")
+        resume = input("Resume from existing file? (y/n, default y): ").strip().lower()
+        if resume != 'n':
+            try:
+                master = pd.read_csv(master_csv_path, low_memory=False, dtype=str)
+                master.fillna('', inplace=True)
+                print(f"Loaded {len(master)} existing matches.")
+
+                if 'Event timestamp' in master.columns:
+                    master['Event timestamp'] = pd.to_datetime(master['Event timestamp'], errors='coerce', utc=True)
+                    max_existing_date = master['Event timestamp'].max()
+                    if pd.notna(max_existing_date):
+                        max_existing_date = max_existing_date.date()
+                        print(f"Latest event date in existing data: {max_existing_date}")
+            except Exception as e:
+                print(f"Failed to load existing file ({e}). Starting fresh.")
+                master = pd.DataFrame()
+
+    zip_files = sorted(glob.glob(os.path.join(CFTC_EQUITY_SOURCE_DIR, '*.zip')),
+                       key=os.path.basename)
+    total_files = len(zip_files)
+
+    if total_files == 0:
+        print("No .zip files found in directory.")
+        return
+
+    if max_existing_date:
+        for i, zf in enumerate(zip_files):
+            zip_date = extract_date_from_filename(zf)
+            if zip_date and zip_date > max_existing_date:
+                start_from_zip_index = i
+                break
+        else:
+            print("Existing results appear up-to-date. No new files to process.")
+            print(f"Total matches: {len(master)}")
+            return
+
+    max_workers = os.cpu_count() or 4
+    print(f"\nProcessing {total_files - start_from_zip_index} file(s) starting from index {start_from_zip_index + 1}...")
+    print(f"Using {max_workers} worker threads (detected CPU count)...")
+
+    search_term_lower = search_term.lower()
+    file_column_counts = {}
+
+    def process_zip(zip_path):
+        local_matches = []
+        local_headers = None
+        added = 0
+
+        try:
+            with ZipFile(zip_path, 'r') as z:
+                csv_name = z.namelist()[0]
+                with z.open(csv_name) as csv_raw:
+                    text_stream = TextIOWrapper(csv_raw, encoding='utf-8', errors='replace')
+                    reader = csv.reader(text_stream, delimiter=',', quotechar='"')
+
+                    headers = next(reader, None)
+                    if not headers:
+                        return [], None, 0
+
+                    n_cols = len(headers)
+                    local_headers = headers
+                    file_column_counts[os.path.basename(zip_path)] = n_cols
+
+                    if 'Product name' not in headers:
+                        return [], None, 0
+
+                    prod_name_idx = headers.index('Product name')
+
+                    for row in reader:
+                        if len(row) < n_cols:
+                            row += [''] * (n_cols - len(row))
+                        elif len(row) > n_cols:
+                            overflow = row[n_cols-1:]
+                            row = row[:n_cols-1] + [','.join(overflow)]
+
+                        product_name = row[prod_name_idx] if prod_name_idx < len(row) else ""
+                        if search_term_lower in product_name.lower():
+                            local_matches.append(row + [search_term])
+                            added += 1
+
+            return local_matches, local_headers, added
+
+        except Exception as e:
+            logging.error(f"Error processing {zip_path}: {e}")
+            return [], None, 0
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_zip = {
+            executor.submit(process_zip, zf): zf
+            for zf in zip_files[start_from_zip_index:]
+        }
+
+        for future in as_completed(future_to_zip):
+            zip_file = future_to_zip[future]
+            try:
+                matches, headers, count = future.result()
+                if matches and headers:
+                    df_new = pd.DataFrame(matches, columns=headers + ['SearchTerm'])
+                    master = pd.concat([master, df_new], ignore_index=True)
+                    master.to_csv(master_csv_path, index=False)
+                    print(f"Processed: {os.path.basename(zip_file)} | Added {count} matches | Total: {len(master)}")
+                    print(f"   Interim save → {master_csv_path}")
+            except Exception as e:
+                print(f"Exception in {os.path.basename(zip_file)}: {e}")
+
+    if not master.empty:
+        master.fillna('', inplace=True)
+        if 'Dissemination Identifier' in master.columns:
+            sort_col = 'Event timestamp' if 'Event timestamp' in master.columns else master.columns[0]
+            master.sort_values(sort_col, ascending=False, inplace=True)
+            master.drop_duplicates(subset=['Dissemination Identifier', 'SearchTerm'], keep='first', inplace=True)
+
+        if 'SearchTerm' in master.columns:
+            search_col = master.pop('SearchTerm')
+            master = master[sorted(master.columns)]
+            master['SearchTerm'] = search_col
+
+        master.to_csv(master_csv_path, index=False)
+        print(f"\nDone! Final file saved: {master_csv_path}")
+        print(f"Total unique matches: {len(master)}")
+        print(f"Final column count: {len(master.columns)}")
+
+        if file_column_counts:
+            cnt = Counter(file_column_counts.values())
+            print("\nColumn count summary across processed files:")
+            for ncols, freq in sorted(cnt.items()):
+                print(f"  {freq} files with {ncols} columns")
+
+        logging.info(f"Completed. Saved {len(master)} matches to {master_csv_path}")
+    else:
+        print("\nNo matches found.")
 def download_cftc_forex_archives():
     os.makedirs(CFTC_FOREX_SOURCE_DIR, exist_ok=True)
 
@@ -2067,63 +2704,167 @@ def download_cftc_forex_archives():
 def cftc_forex_second():
     gamecat_ascii()
 
-    def process_zip(zip_file):
-        results = []
-        try:
-            with ZipFile(zip_file, 'r') as zip_ref:
-                csv_filename = zip_ref.namelist()[0]  # Assuming only one CSV per zip
-                with zip_ref.open(csv_filename) as csv_file:
-                    df = pd.read_csv(csv_file, low_memory=False)
-                    for column in df.columns:
-                        if column in df.columns and df[column].astype(str).str.contains(search_term, case=False, na=False).any():
-                            matching_rows = df[df[column].astype(str).str.contains(search_term, case=False, na=False)]
-                            results.extend(matching_rows.to_dict('records'))  # Convert matching rows to list of dicts
-                            break  # We've found a match, no need to check other columns
-        except Exception as e:
-            logging.error(f"Error processing {zip_file}: {e}")
-        return results
+    def extract_date_from_filename(filename):
+        match = re.search(r'(\d{4}_\d{2}_\d{2})', os.path.basename(filename))
+        if match:
+            date_str = match.group(1).replace('_', '-')
+            try:
+                return datetime.strptime(date_str, '%Y-%m-%d').date()
+            except ValueError:
+                return None
+        return None
 
-    def write_to_csv(results, csv_writer):
-        for row in results:
-            csv_writer.writerow(row)
-
-    # Main execution
-    print("Press Enter when you are ready to parse the files, or type 'q' to quit.")
-    user_input = input()
-    if user_input.lower() != 'q':
-        search_term = input("Enter the search term: ").strip()
-        zip_files = sorted(glob.glob(os.path.join(CFTC_FOREX_SOURCE_DIR, '*.zip')), key=lambda x: os.path.basename(x))
-        total_files = len(zip_files)
-        print(f"\nStarting to process {total_files} zip files with 7 worker threads...")
-
-        master_csv_path = os.path.join(CFTC_FOREX_SOURCE_DIR, f"filtered_{search_term.replace(' ', '_')}.csv")
-        
-        with open(master_csv_path, 'w', newline='') as csvfile:
-            csv_writer = csv.DictWriter(csvfile, fieldnames=None)  # We'll define fieldnames later
-            header_written = False
-
-            with ThreadPoolExecutor(max_workers=7) as executor:
-                # Process zip files
-                future_to_zip = {executor.submit(process_zip, zip_file): zip_file for zip_file in zip_files}
-                
-                for future in as_completed(future_to_zip):
-                    zip_file = future_to_zip[future]
-                    try:
-                        results = future.result()
-                        if results and not header_written:
-                            # Write header only once
-                            csv_writer.fieldnames = results[0].keys()
-                            csv_writer.writeheader()
-                            header_written = True
-                        write_to_csv(results, csv_writer)
-                        print(f"Processed: {zip_file}")
-                    except Exception as e:
-                        print(f"Exception in {zip_file}: {e}")
-            
-            print(f"\nSaving results to: {master_csv_path}")
-        logging.info(f"Parsing completed. Master file saved as {master_csv_path}")
-    else:
+    print("Press Enter when ready to parse files, or type 'q' to quit.")
+    user_input = input().strip()
+    if user_input.lower() == 'q':
         print("Exiting script.")
+        return
+
+    search_term = input("Enter the search term: ").strip()
+    if not search_term:
+        print("No search term provided. Exiting.")
+        return
+
+    safe_term = re.sub(r'\W+', '_', search_term)
+    master_csv_path = os.path.join(CFTC_FOREX_SOURCE_DIR, f"filtered_{safe_term}.csv")
+
+    master = pd.DataFrame()
+    start_from_zip_index = 0
+    max_existing_date = None
+
+    if os.path.exists(master_csv_path):
+        print(f"Found existing output: {master_csv_path}")
+        resume = input("Resume from existing file? (y/n, default y): ").strip().lower()
+        if resume != 'n':
+            try:
+                master = pd.read_csv(master_csv_path, low_memory=False, dtype=str)
+                master.fillna('', inplace=True)
+                print(f"Loaded {len(master)} existing matches.")
+
+                if 'Event timestamp' in master.columns:
+                    master['Event timestamp'] = pd.to_datetime(master['Event timestamp'], errors='coerce', utc=True)
+                    max_existing_date = master['Event timestamp'].max()
+                    if pd.notna(max_existing_date):
+                        max_existing_date = max_existing_date.date()
+                        print(f"Latest event date in existing data: {max_existing_date}")
+            except Exception as e:
+                print(f"Failed to load existing file ({e}). Starting fresh.")
+                master = pd.DataFrame()
+
+    zip_files = sorted(glob.glob(os.path.join(CFTC_FOREX_SOURCE_DIR, '*.zip')),
+                       key=os.path.basename)
+    total_files = len(zip_files)
+
+    if total_files == 0:
+        print("No .zip files found in directory.")
+        return
+
+    if max_existing_date:
+        for i, zf in enumerate(zip_files):
+            zip_date = extract_date_from_filename(zf)
+            if zip_date and zip_date > max_existing_date:
+                start_from_zip_index = i
+                break
+        else:
+            print("Existing results appear up-to-date. No new files to process.")
+            print(f"Total matches: {len(master)}")
+            return
+
+    max_workers = os.cpu_count() or 4
+    print(f"\nProcessing {total_files - start_from_zip_index} file(s) starting from index {start_from_zip_index + 1}...")
+    print(f"Using {max_workers} worker threads (detected CPU count)...")
+
+    search_term_lower = search_term.lower()
+    file_column_counts = {}
+
+    def process_zip(zip_path):
+        local_matches = []
+        local_headers = None
+        added = 0
+
+        try:
+            with ZipFile(zip_path, 'r') as z:
+                csv_name = z.namelist()[0]
+                with z.open(csv_name) as csv_raw:
+                    text_stream = TextIOWrapper(csv_raw, encoding='utf-8', errors='replace')
+                    reader = csv.reader(text_stream, delimiter=',', quotechar='"')
+
+                    headers = next(reader, None)
+                    if not headers:
+                        return [], None, 0
+
+                    n_cols = len(headers)
+                    local_headers = headers
+                    file_column_counts[os.path.basename(zip_path)] = n_cols
+
+                    if 'Product name' not in headers:
+                        return [], None, 0
+
+                    prod_name_idx = headers.index('Product name')
+
+                    for row in reader:
+                        if len(row) < n_cols:
+                            row += [''] * (n_cols - len(row))
+                        elif len(row) > n_cols:
+                            overflow = row[n_cols-1:]
+                            row = row[:n_cols-1] + [','.join(overflow)]
+
+                        product_name = row[prod_name_idx] if prod_name_idx < len(row) else ""
+                        if search_term_lower in product_name.lower():
+                            local_matches.append(row + [search_term])
+                            added += 1
+
+            return local_matches, local_headers, added
+
+        except Exception as e:
+            logging.error(f"Error processing {zip_path}: {e}")
+            return [], None, 0
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_zip = {
+            executor.submit(process_zip, zf): zf
+            for zf in zip_files[start_from_zip_index:]
+        }
+
+        for future in as_completed(future_to_zip):
+            zip_file = future_to_zip[future]
+            try:
+                matches, headers, count = future.result()
+                if matches and headers:
+                    df_new = pd.DataFrame(matches, columns=headers + ['SearchTerm'])
+                    master = pd.concat([master, df_new], ignore_index=True)
+                    master.to_csv(master_csv_path, index=False)
+                    print(f"Processed: {os.path.basename(zip_file)} | Added {count} matches | Total: {len(master)}")
+                    print(f"   Interim save → {master_csv_path}")
+            except Exception as e:
+                print(f"Exception in {os.path.basename(zip_file)}: {e}")
+
+    if not master.empty:
+        master.fillna('', inplace=True)
+        if 'Dissemination Identifier' in master.columns:
+            sort_col = 'Event timestamp' if 'Event timestamp' in master.columns else master.columns[0]
+            master.sort_values(sort_col, ascending=False, inplace=True)
+            master.drop_duplicates(subset=['Dissemination Identifier', 'SearchTerm'], keep='first', inplace=True)
+
+        if 'SearchTerm' in master.columns:
+            search_col = master.pop('SearchTerm')
+            master = master[sorted(master.columns)]
+            master['SearchTerm'] = search_col
+
+        master.to_csv(master_csv_path, index=False)
+        print(f"\nDone! Final file saved: {master_csv_path}")
+        print(f"Total unique matches: {len(master)}")
+        print(f"Final column count: {len(master.columns)}")
+
+        if file_column_counts:
+            cnt = Counter(file_column_counts.values())
+            print("\nColumn count summary across processed files:")
+            for ncols, freq in sorted(cnt.items()):
+                print(f"  {freq} files with {ncols} columns")
+
+        logging.info(f"Completed. Saved {len(master)} matches to {master_csv_path}")
+    else:
+        print("\nNo matches found.")
 def download_ncen_archives():
     BASE_URL = "https://www.sec.gov/files/dera/data/form-n-cen-data-sets/"
     urls = [
