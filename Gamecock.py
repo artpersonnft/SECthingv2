@@ -37,7 +37,8 @@ CFTC_RATES_SOURCE_DIR = os.path.join(ROOT_DIR, "CFTC_IR")
 EDGAR_SOURCE_DIR = os.path.join(ROOT_DIR, "EDGAR")
 EXCHANGE_SOURCE_DIR = os.path.join(ROOT_DIR, "EXCHANGE")
 INSIDER_SOURCE_DIR = os.path.join(ROOT_DIR, "INSIDERS")
-NCSR_DIR = os.path.join(ROOT_DIR, "NCSR")  # New subdir for isolation
+NCSR_DIR = os.path.join(ROOT_DIR, "NCSR")
+FTD_DIR = os.path.join(ROOT_DIR, "FTD")
 
 directories = [
     INSIDER_SOURCE_DIR,
@@ -967,6 +968,189 @@ def allyourbasearebelongtous():
 
     except Exception as e:
         log_progress(f"An error occurred: {e}")
+
+def download_ftd_filings():
+    from datetime import datetime
+    from dateutil.relativedelta import relativedelta
+    os.makedirs(FTD_DIR, exist_ok=True)
+    gamecat_ascii()
+
+    def generate_urls():
+        base_url = "https://www.sec.gov"
+        file_names = []
+
+        # Schema 1: Quarterly files (cnsp_sec_fails_YYYYqN.zip) from 2004Q1 to 2009Q2
+        for year in range(2004, 2010):  # 2004 to 2009
+            for quarter in range(1, 5):  # Q1 to Q4
+                if year == 2009 and quarter > 2:  # Stop at 2009Q2
+                    break
+                file_names.append(f"/files/data/frequently-requested-foia-document-fails-deliver-data/cnsp_sec_fails_{year}q{quarter}.zip")
+                if year == 2004 and quarter == 1:  # Special case: 2004Q1
+                    file_names.append(f"/files/data/fails-deliver-data/cnsp_sec_fails_{year}q{quarter}.zip")
+
+        # Schema 2: Monthly files in /files/node/add/data_distribution/ (202002–202004)
+        for month in range(2, 5):  # February to April 2020
+            file_names.append(f"/files/node/add/data_distribution/cnsfails2020{month:02d}a.zip")
+            file_names.append(f"/files/node/add/data_distribution/cnsfails2020{month:02d}b.zip")
+
+        # Schema 3: Monthly files in /files/data/frequently-requested-foia-document-fails-deliver-data/ (201101–201706)
+        for year in range(2011, 2018):  # 2011 to 2017
+            for month in range(1, 13):  # January to December
+                if year == 2017 and month > 6:  # Stop at June 2017
+                    break
+                file_names.append(f"/files/data/frequently-requested-foia-document-fails-deliver-data/cnsfails{year}{month:02d}a.zip")
+                file_names.append(f"/files/data/frequently-requested-foia-document-fails-deliver-data/cnsfails{year}{month:02d}b.zip")
+
+        # Special case: cnsfails201910a_0.zip
+        file_names.append("/files/data/fails-deliver-data/cnsfails201910a_0.zip")
+
+        # Schema 4: Current schema (cnsfailsYYYYMMa/b.zip) from July 2009 to current month
+        current_date = datetime.now()
+        start_date = datetime(2009, 7, 1)  # Start from July 2009
+        end_date = current_date.replace(day=1)  # Start of current month (October 2025)
+        current = start_date
+        while current <= end_date:
+            year = current.year
+            month = current.month
+            # Skip months covered by other schemas (201101–201706, 202002–202004)
+            if (year == 2020 and 2 <= month <= 4) or (year == 2011 and month >= 1) or (2012 <= year <= 2016) or (year == 2017 and month <= 6):
+                current += relativedelta(months=1)
+                continue
+            # Add 'a' file for all months
+            file_names.append(f"/files/data/fails-deliver-data/cnsfails{year}{month:02d}a.zip")
+            # Add 'b' file only if not in the current month (to avoid future files like 202510b)
+            if current < end_date:
+                file_names.append(f"/files/data/fails-deliver-data/cnsfails{year}{month:02d}b.zip")
+            # Special case: Replace cnsfails201910a.zip with cnsfails201910a_0.zip
+            if year == 2019 and month == 10:
+                file_names.remove(f"/files/data/fails-deliver-data/cnsfails{year}{month:02d}a.zip")
+            current += relativedelta(months=1)
+
+        def sort_key(filename):
+            """Sort filenames based on year and period, handling multiple schemas."""
+            filename = filename.split('/')[-1]
+            
+            # Default values for sorting
+            year = 0
+            period = 0
+            subperiod = ''  # For 'a'/'b' in monthly files or empty for quarterly
+
+            # Schema 1: cnsfailsYYYYMMa.zip or cnsfailsYYYYMMb.zip
+            if filename.startswith('cnsfails') and filename.endswith('.zip'):
+                match = re.match(r'cnsfails(\d{4})(\d{2})([ab])\.zip$', filename)
+                if match:
+                    year = int(match.group(1))  # YYYY
+                    month = int(match.group(2))  # MM
+                    subperiod = match.group(3)  # 'a' or 'b'
+                    period = month * 2 - 1 if subperiod == 'a' else month * 2
+                    return (year, period, subperiod)
+            
+            # Schema 2: cnsfailsYYYYMMa_0.zip (e.g., cnsfails201910a_0.zip)
+            elif filename.startswith('cnsfails') and filename.endswith('_0.zip'):
+                match = re.match(r'cnsfails(\d{4})(\d{2})([ab])_0\.zip$', filename)
+                if match:
+                    year = int(match.group(1))  # YYYY
+                    month = int(match.group(2))  # MM
+                    subperiod = match.group(3)  # 'a' or 'b'
+                    period = month * 2 - 1 if subperiod == 'a' else month * 2
+                    return (year, period, subperiod)
+            
+            # Schema 3: cnsp_sec_fails_YYYYqN.zip
+            elif filename.startswith('cnsp_sec_fails_'):
+                match = re.match(r'cnsp_sec_fails_(\d{4})q([1-4])\.zip$', filename)
+                if match:
+                    year = int(match.group(1))  # YYYY
+                    quarter = int(match.group(2))  # 1-4
+                    period = quarter
+                    return (year, period, '')
+            
+            # Fallback for unrecognized formats
+            return (year, period, subperiod)
+
+        sorted_file_names = sorted(file_names, key=sort_key)
+        url_list = [f"{base_url}{file_name}" for file_name in sorted_file_names]
+        return url_list
+
+    urls = generate_urls()
+
+    # Pass the sorted URLs to download_archives
+    download_archives(FTD_DIR, FILELIST, urls)
+
+    print("Download of historical exchange volume archive completed.")
+    ftdquery = input("Would you like to search? (y)es or (n)o?:").strip()
+    if ftdquery == 'y':
+        ftd_second()
+    else:
+        print("Y not pushed. exiting.")
+        exit(1)
+def ftd_second():
+    gamecat_ascii()
+
+    def parse_zips_in_batches(search_term, search_column, batch_size=100):
+        master = pd.DataFrame()  # Start with an empty dataframe
+        zip_files = sorted(glob.glob(os.path.join(FTD_DIR, '*.zip')), key=lambda x: os.path.basename(x))
+        total_files = len(zip_files)
+        results_count = 0
+        
+        print(f"\nStarting to process {total_files} zip files...")
+        for i in range(0, total_files, batch_size):
+            batch = zip_files[i:i+batch_size]
+            for index, zip_file in enumerate(batch, 1):
+                print(f"\nProcessing file {i + index}/{total_files}: {zip_file}")
+                try:
+                    with ZipFile(zip_file, 'r') as zip_ref:
+                        csv_filename = zip_ref.namelist()[0]  # Assuming one CSV per zip
+                        print(f"Reading CSV file: {csv_filename}")
+                        with zip_ref.open(csv_filename) as csv_file:
+                            # Try UTF-8 first, fall back to latin1 for decoding errors
+                            try:
+                                df = pd.read_csv(csv_file, sep='|', low_memory=False, on_bad_lines='skip')
+                            except UnicodeDecodeError:
+                                logging.warning(f"UTF-8 decoding failed for {csv_filename}. Trying latin1 encoding.")
+                                csv_file.seek(0)  # Reset file pointer
+                                df = pd.read_csv(csv_file, sep='|', encoding='latin1', low_memory=False, on_bad_lines='skip')
+                            # Verify required columns exist
+                            required_columns = ['SETTLEMENT DATE', 'CUSIP', 'SYMBOL']
+                            if not all(col in df.columns for col in required_columns):
+                                print(f"Skipping {csv_filename}: Missing required columns {required_columns}")
+                                logging.warning(f"File {csv_filename} does not contain all required columns: {df.columns}")
+                                continue
+                            # Search for exact match in the specified column (case-insensitive)
+                            if search_column in df.columns and (df[search_column].str.upper() == search_term.upper()).any():
+                                print(f"Matches found in column: {search_column}")
+                                matching_rows = df[df[search_column].str.upper() == search_term.upper()]
+                                master = pd.concat([master, matching_rows], ignore_index=True)
+                                results_count += len(matching_rows)
+                                print(f"Added {len(matching_rows)} matching rows. Total matches so far: {results_count}")
+                            else:
+                                print(f"No matches found in {csv_filename}")
+                except Exception as e:
+                    logging.error(f"Error processing {zip_file}: {e}")
+                    print(f"Error occurred while processing {zip_file}. Continuing to next file.")
+        return master, results_count
+
+    print("Press Enter when you are ready to parse the files (q to quit):")
+    user_input = input()
+    if user_input.lower() != 'q':
+        search_column = input("Enter the column to search (C for CUSIP, S for SYMBOL): ").strip().upper()
+        if search_column == 'C':
+            search_column = 'CUSIP'
+        elif search_column == 'S':
+            search_column = 'SYMBOL'
+        else:
+            print("Invalid input. Please enter 'C' or 'S'.")
+            logging.error(f"Invalid column input: {search_column}")
+            return
+        search_term = input(f"Enter the search term for {search_column}: ").strip()
+        master, final_count = parse_zips_in_batches(search_term, search_column)
+        master_csv_path = os.path.join(FTD_DIR, f"filtered_{search_term.replace(' ', '_')}.csv")
+        master.to_csv(master_csv_path, index=False)
+        print(f"\nSaving results to: {master_csv_path}")
+        print(f"Total Matches Found: {final_count}")
+        logging.info(f"Parsing completed. Master file saved as {master_csv_path}")
+    else:
+        print("Exiting script.")
+
 def download_credit_archives():
     os.makedirs(CREDIT_SOURCE_DIR, exist_ok=True)
     gamecat_ascii()
@@ -1152,72 +1336,194 @@ def download_equities_archives():
 def equities_second():
     gamecat_ascii()
     
-    def parse_zips(search_terms):
-        master = pd.DataFrame()  # Start with an empty dataframe
-        zip_files = sorted(glob.glob(os.path.join(EQUITY_SOURCE_DIR, '*.zip')), key=lambda x: os.path.basename(x))  # Sort by filename
-        first_file_processed = False
-        first_headers = None
-        total_files = len(zip_files)
-        results_count = 0
-        print(f"\nStarting to process {total_files} zip files...")
-        for index, zip_file in enumerate(zip_files, 1):
-            print(f"\nProcessing file {index}/{total_files}: {zip_file}")
+    import csv
+    from io import TextIOWrapper
+    import re
+    from datetime import datetime
+    
+    def extract_date_from_filename(filename):
+        match = re.search(r'(\d{4}_\d{2}_\d{2})', os.path.basename(filename))
+        if match:
+            date_str = match.group(1).replace('_', '-')
             try:
-                with ZipFile(zip_file, 'r') as zip_ref:
-                    csv_filename = zip_ref.namelist()[0]  # Assuming one CSV per zip
-                    print(f"Reading CSV file: {csv_filename}")
-                    with zip_ref.open(csv_filename) as csv_file:
-                        df = pd.read_csv(csv_file, low_memory=False)
-                        if not first_file_processed:
-                            first_headers = df.columns.tolist()
-                            first_file_processed = True
-                        # Combine all columns into a single string per row
-                        df['combined'] = df.apply(lambda row: ' '.join(row.astype(str)), axis=1)
-                        matching_rows = pd.DataFrame()  # Store matches for this file
-                        for term in search_terms:
-                            is_quoted = term.startswith('"') and term.endswith('"')
-                            clean_term = term.strip('"') if is_quoted else term
-                            # Wider scope for unquoted terms (anywhere in combined)
-                            if not is_quoted:
-                                mask = df['combined'].str.contains(clean_term, case=False, na=False)
-                            # Limited scope for quoted terms (exact match in Product name, no suffixes)
-                            else:
-                                mask = df['Product name'].astype(str).str.contains(fr'\b{re.escape(clean_term)}\b', case=False, na=False)
-                            temp_rows = df[mask].copy()
-                            if not temp_rows.empty:
-                                temp_rows['SearchTerm'] = term  # Track original term
-                                matching_rows = pd.concat([matching_rows, temp_rows], ignore_index=True)
-                        # Drop the 'combined' column if it exists
-                        if 'combined' in matching_rows.columns:
-                            matching_rows = matching_rows.drop(columns=['combined'])
-                        master = pd.concat([master, matching_rows], ignore_index=True)
-                        results_count += len(matching_rows)
-                        print(f"Added {len(matching_rows)} matching rows. Total matches so far: {results_count}")
-            except Exception as e:
-                logging.error(f"Error processing {zip_file}: {e}")
-                print(f"Error occurred while processing {zip_file}. Continuing to next file.")
-            print(f"Current matches count: {results_count}")
-        
-        # Ensure the CSV starts with the first file's headers
-        if first_headers:
-            master = master.reindex(columns=first_headers, fill_value=None)
-        return master, results_count
-
+                return datetime.strptime(date_str, '%Y-%m-%d').date()
+            except:
+                pass
+        return None
+    
+    def clean_underlier(value):
+        if not isinstance(value, str):
+            return value
+        cleaned = value.replace('""', '"')
+        cleaned = cleaned.strip('"')
+        return cleaned
+    
     print("Press Enter when you are ready to parse the files, or type 'q' to quit.")
     user_input = input()
     if user_input.lower() != 'q':
         search_terms_input = input("Enter search terms separated by commas: ").strip()
-        search_terms = [term.strip() for term in search_terms_input.split(',')]
+        search_terms = [term.strip() for term in search_terms_input.split(',') if term.strip()]
         if not search_terms:
             print("No search terms provided. Exiting.")
             return
-        master, final_count = parse_zips(search_terms)
+        
         safe_terms = [re.sub(r'\W+', '_', term) for term in search_terms]
         master_csv_path = os.path.join(EQUITY_SOURCE_DIR, f"filtered_{'_'.join(safe_terms)}.csv")
-        master.to_csv(master_csv_path, index=False)
-        print(f"\nSaving results to: {master_csv_path}")
-        print(f"Total Matches Found: {final_count}")
-        logging.info(f"Parsing completed. Master file saved as {master_csv_path}")
+        
+        master = pd.DataFrame()
+        start_from_zip_index = 0
+        max_existing_date = None
+        
+        if os.path.exists(master_csv_path):
+            print(f"Existing output found: {master_csv_path}")
+            resume = input("Resume from existing file? (y/n, default y): ").strip().lower()
+            if resume != 'n':
+                try:
+                    master = pd.read_csv(master_csv_path, low_memory=False, dtype=str)
+                    master.fillna('', inplace=True)
+                    print(f"Loaded {len(master)} existing matches.")
+                    
+                    if 'Event timestamp' in master.columns:
+                        master['Event timestamp'] = pd.to_datetime(master['Event timestamp'], errors='coerce', utc=True)
+                        max_existing_date = master['Event timestamp'].max()
+                        if pd.notna(max_existing_date):
+                            max_existing_date = max_existing_date.date()
+                            print(f"Latest event date in existing results: {max_existing_date}")
+                except Exception as e:
+                    print(f"Could not load existing file ({e}). Starting fresh.")
+                    master = pd.DataFrame()
+        
+        zip_files = sorted(glob.glob(os.path.join(EQUITY_SOURCE_DIR, '*.zip')),
+                           key=lambda x: os.path.basename(x))
+        total_files = len(zip_files)
+        
+        if total_files == 0:
+            print("No zip files found.")
+            return
+        
+        if max_existing_date:
+            for i, zf in enumerate(zip_files):
+                zip_date = extract_date_from_filename(zf)
+                if zip_date and zip_date > max_existing_date:
+                    start_from_zip_index = i
+                    break
+            else:
+                print("Existing results are up to date. No new files to process.")
+                return
+        
+        print(f"\nStarting processing from file {start_from_zip_index + 1}/{total_files} onwards...")
+        
+        results_count = len(master)
+        term_info = [(term, term.strip('"').lower() if term.startswith('"') and term.endswith('"') else term.lower(),
+                      term.startswith('"') and term.endswith('"')) for term in search_terms]
+        loose_needed = any(not is_quoted for _, _, is_quoted in term_info)
+        
+        file_schema_counts = {}  # Track header counts per file for final summary
+        
+        for index in range(start_from_zip_index, total_files):
+            zip_file = zip_files[index]
+            print(f"\nProcessing file {index + 1}/{total_files}: {zip_file}")
+            matches_in_file = 0
+            file_matching_rows = []
+            
+            try:
+                with ZipFile(zip_file, 'r') as zip_ref:
+                    csv_filename = zip_ref.namelist()[0]
+                    print(f"Reading CSV: {csv_filename}")
+                    with zip_ref.open(csv_filename) as csv_file:
+                        text_file = TextIOWrapper(csv_file, encoding='utf-8', errors='replace')
+                        reader = csv.reader(text_file, delimiter=',', quotechar='"')
+                        
+                        file_headers = next(reader, None)
+                        if not file_headers:
+                            print("No headers found in this file. Skipping.")
+                            continue
+                        
+                        header_count = len(file_headers)
+                        print(f"Detected {header_count} columns in this file.")
+                        file_schema_counts[zip_file] = header_count
+                        
+                        if 'Product name' not in file_headers:
+                            print("Required column 'Product name' missing in this file. Skipping.")
+                            continue
+                        
+                        product_name_idx = file_headers.index('Product name')
+                        last_col_idx = len(file_headers) - 1
+                        
+                        for row_num, row in enumerate(reader, start=2):
+                            current_cols = len(file_headers)
+                            if len(row) > current_cols:
+                                overflow = row[current_cols:]
+                                row = row[:current_cols-1] + [row[current_cols-1] + ','.join(overflow)]
+                            elif len(row) < current_cols:
+                                row += [''] * (current_cols - len(row))
+                            
+                            row[last_col_idx] = clean_underlier(row[last_col_idx])
+                            
+                            row_combined_lower = None
+                            if loose_needed:
+                                row_combined_lower = ' '.join(row).lower()
+                            
+                            product_name = row[product_name_idx]
+                            
+                            matching_terms = []
+                            for orig_term, clean_term, is_quoted in term_info:
+                                if is_quoted:
+                                    if re.search(fr'\b{re.escape(clean_term)}\b', product_name, re.IGNORECASE):
+                                        matching_terms.append(orig_term)
+                                else:
+                                    if clean_term in row_combined_lower:
+                                        matching_terms.append(orig_term)
+                            
+                            if matching_terms:
+                                for term in matching_terms:
+                                    extended_row = row[:] + [term]
+                                    file_matching_rows.append(extended_row)
+                                matches_in_file += len(matching_terms)
+                        
+                        if file_matching_rows:
+                            file_df = pd.DataFrame(file_matching_rows, columns=file_headers + ['SearchTerm'])
+                            master = pd.concat([master, file_df], ignore_index=True)
+                            results_count += len(file_matching_rows)
+                            
+                            # Interim save after each file with matches
+                            master.to_csv(master_csv_path, index=False)
+                            print(f"Interim save: {len(master)} total matches written to {master_csv_path}")
+                        
+                        print(f"Added {matches_in_file} new matches from this file. Current total: {results_count}")
+            except Exception as e:
+                logging.error(f"Error processing {zip_file}: {e}")
+                print(f"Error processing {zip_file}: {e}. Continuing...")
+        
+        if not master.empty:
+            master.fillna('', inplace=True)
+            
+            # Final deduplication and sorting
+            if 'Dissemination Identifier' in master.columns:
+                master.sort_values('Event timestamp' if 'Event timestamp' in master.columns else master.columns[0], ascending=False, inplace=True)
+                master.drop_duplicates(subset=['Dissemination Identifier', 'SearchTerm'], keep='first', inplace=True)
+            
+            # Final column ordering
+            search_term_col = master.pop('SearchTerm') if 'SearchTerm' in master.columns else None
+            master = master[sorted(master.columns)]
+            if search_term_col is not None:
+                master['SearchTerm'] = search_term_col
+            
+            # Final save (overwrites interim with cleaned version)
+            master.to_csv(master_csv_path, index=False)
+            print(f"\nFinal save complete: {master_csv_path}")
+            print(f"Total Unique Matches Found: {len(master)}")
+            print(f"Final output has {len(master.columns)} columns (union of all schemas).")
+            
+            # Schema summary
+            from collections import Counter
+            schema_summary = Counter(file_schema_counts.values())
+            print("\nSchema summary across processed files:")
+            for count, freq in sorted(schema_summary.items()):
+                print(f"  {freq} files with {count} columns")
+            logging.info(f"Parsing completed. Master file saved as {master_csv_path}")
+        else:
+            print("No matches found.")
     else:
         print("Exiting script.")
 def download_cftc_credit_archives():
@@ -4480,7 +4786,6 @@ def write_to_csv(queue, output_file, verbose=False):
             except Exception as e:
                 if verbose:
                     print(f"Error writing to CSV: {e}")
-
 def parse_nport_xml(xml_content, file_name, search_term="GameStop", cusip="36467W109"):
     """
     Parse N-PORT XML content for specified search term or CUSIP.
@@ -4522,7 +4827,6 @@ def parse_nport_xml(xml_content, file_name, search_term="GameStop", cusip="36467
     except Exception as e:
         print(f"Error parsing N-PORT XML {file_name}: {e}")
         return pd.DataFrame()
-
 def parse_ncen_xml(xml_content, file_name):
     """
     Parse N-CEN XML content for fund metadata and exemptions.
@@ -4559,7 +4863,6 @@ def parse_ncen_xml(xml_content, file_name):
     except Exception as e:
         print(f"Error parsing N-CEN XML {file_name}: {e}")
         return pd.DataFrame()
-
 def parse_ncsr_text(text_content, file_name, search_term="GameStop", cusip="36467W109"):
     """
     Parse N-CSR text content for specified search term or CUSIP.
@@ -4596,7 +4899,6 @@ def parse_ncsr_text(text_content, file_name, search_term="GameStop", cusip="3646
     except Exception as e:
         print(f"Error parsing N-CSR {file_name}: {e}")
         return pd.DataFrame()
-
 def parse_nmfp_xml(xml_content, file_name, search_term="GameStop", cusip="36467W109"):
     """
     Parse N-MFP XML content for specified search term or CUSIP.
@@ -4648,7 +4950,6 @@ def parse_nmfp_xml(xml_content, file_name, search_term="GameStop", cusip="36467W
     except Exception as e:
         print(f"Error parsing N-MFP XML {file_name}: {e}")
         return pd.DataFrame()
-
 def unify_nport_ncen(nport_df, ncen_df):
     """
     Unify N-PORT and N-CEN DataFrames on CIK and Period_End.
@@ -4670,7 +4971,6 @@ def unify_nport_ncen(nport_df, ncen_df):
     unified['Exemptions'] = unified['Exemptions'].fillna('None')
     print(f"Unification complete: {len(unified)} rows")
     return unified
-
 def correlate_with_ncsr(unified_df, ncsr_df, nmfp_df=None):
     """
     Correlate unified DataFrame with N-CSR and N-MFP data.
@@ -4703,7 +5003,6 @@ def correlate_with_ncsr(unified_df, ncsr_df, nmfp_df=None):
     else:
         print("No data to correlate")
     return combined
-
 def export_to_csv(df, output_path):
     """
     Export the final DataFrame to CSV.
@@ -4711,7 +5010,6 @@ def export_to_csv(df, output_path):
     print(f"Exporting to {output_path}...")
     df.to_csv(output_path, index=False)
     print(f"Export complete: {len(df)} rows written")
-
 def process_zip_files(source_dir, extension, parse_func, search_term, cusip, is_text=False):
     """
     Generic ZIP processor for all archive types.
@@ -4735,7 +5033,6 @@ def process_zip_files(source_dir, extension, parse_func, search_term, cusip, is_
     else:
         print(f"Directory not found: {source_dir}")
     return dfs
-
 def parse_all_filings(search_term="GameStop", cusip="36467W109"):
     """
     Chain parsing of ZIP archives for N-PORT, N-CSR, N-CEN, N-MFP.
@@ -5351,7 +5648,6 @@ def count():
             print("No data to save.")
     else:
         print("Exiting script.")
-
 def count2():
     from collections import defaultdict
 
@@ -5557,6 +5853,7 @@ if __name__ == "__main__":
     print("c: Codex Of Instruments")
     print("a: Allyourbasearebelongtous- scrape every edgar filing ever.")
     print("n: create an N-CSR archive from edgar indexes")
+    print("f: FTD archives for analyze's charts.")
 
     query = input("Enter the number corresponding to your choice: ").strip()
     if query.isdigit() and 4 <= len(query) <= 7:
@@ -5759,6 +6056,8 @@ if __name__ == "__main__":
         edgartotal()
     elif query == 'n':
         download_ncsr_filings()
+    elif query == 'f':
+        download_ftd_filings()
     else:
         print("Invalid input. Please enter one of the following: 69420gmerica.")
         exit(1)
