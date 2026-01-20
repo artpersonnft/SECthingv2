@@ -1601,6 +1601,7 @@ def download_equities_archives():
         exit(1)
 def equities_second():
     gamecat_ascii()
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
     def extract_date_from_filename(filename):
         match = re.search(r'(\d{4}_\d{2}_\d{2})', os.path.basename(filename))
@@ -1688,8 +1689,24 @@ def equities_second():
     ]
     loose_needed = any(not is_quoted for _, _, is_quoted in term_info)
     file_schema_counts = {}
+    ref_schema_hash = None
+    mismatch_count = 0
+
+    CONSOLIDATE_MAP = {
+        'Call amount': 'Call amount-Leg 1',
+        'Call currency': 'Call currency-Leg 1',
+        'Put amount': 'Put amount-Leg 1',
+        'Put currency': 'Put currency-Leg 1',
+        'Settlement location': 'Settlement location-Leg 1',
+    }
+
+    def get_schema_hash(headers):
+        normalized = sorted(h.strip().lower().replace(' ', '_') for h in headers)
+        return hashlib.sha256(','.join(normalized).encode()).hexdigest()[:16]
 
     def process_zip(zip_path):
+        nonlocal ref_schema_hash, mismatch_count
+
         local_matches = []
         local_headers = None
         matches_in_file = 0
@@ -1710,6 +1727,17 @@ def equities_second():
 
                     if 'Product name' not in file_headers:
                         return [], None, 0
+
+                    current_hash = get_schema_hash(file_headers)
+                    if ref_schema_hash is None:
+                        ref_schema_hash = current_hash
+                    elif current_hash != ref_schema_hash:
+                        mismatch_count += 1
+                        logging.warning(f"Schema mismatch detected in {os.path.basename(zip_path)} (hash: {current_hash})")
+
+                    rename_dict = {k: v for k, v in CONSOLIDATE_MAP.items() if k in file_headers}
+                    if rename_dict:
+                        file_headers = [rename_dict.get(h, h) for h in file_headers]
 
                     product_name_idx = file_headers.index('Product name')
                     last_col_idx = len(file_headers) - 1
@@ -1734,7 +1762,10 @@ def equities_second():
                                 if re.search(fr'\b{re.escape(clean_term)}\b', product_name, re.IGNORECASE):
                                     matching_terms.append(orig_term)
                             else:
-                                if row_combined_lower and clean_term in row_combined_lower:
+                                # Loose term: ticker at word boundary + any non-space suffix
+                                # → includes basket swap entries like ;GME, ;GME.N, AAPL;GME; etc.
+                                pattern = rf'(?i)\b{re.escape(clean_term)}\b\S*'
+                                if row_combined_lower and re.search(pattern, row_combined_lower):
                                     matching_terms.append(orig_term)
 
                         if matching_terms:
@@ -1764,7 +1795,6 @@ def equities_second():
                     file_df = pd.DataFrame(file_matches, columns=headers + ['SearchTerm'])
                     master = pd.concat([master, file_df], ignore_index=True)
 
-                    # Interim save
                     master.to_csv(master_csv_path, index=False)
                     print(f"Processed: {os.path.basename(zip_file)} | Added {count} matches | Total now: {len(master)}")
                     print(f"   Interim save → {master_csv_path}")
@@ -1788,13 +1818,18 @@ def equities_second():
         master.to_csv(master_csv_path, index=False)
         print(f"\nFinal save complete: {master_csv_path}")
         print(f"Total Unique Matches Found: {len(master)}")
-        print(f"Final output has {len(master.columns)} columns (union of all schemas).")
+        print(f"Final output has {len(master.columns)} columns (normalized union).")
 
         if file_schema_counts:
             schema_summary = Counter(file_schema_counts.values())
             print("\nSchema summary across processed files:")
             for count, freq in sorted(schema_summary.items()):
                 print(f"  {freq} files with {count} columns")
+
+        if mismatch_count > 0:
+            print(f"\nNote: {mismatch_count} files had a different schema variant (data normalized where possible).")
+        else:
+            print("\nAll files had consistent or successfully normalized schemas.")
 
         logging.info(f"Parsing completed. Master file saved as {master_csv_path}")
     else:
