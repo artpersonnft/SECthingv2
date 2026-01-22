@@ -1599,6 +1599,7 @@ def download_equities_archives():
     else:
         print("Y not pushed. exiting.")
         exit(1)
+
 def equities_second():
     gamecat_ascii()
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -1657,6 +1658,18 @@ def equities_second():
             except Exception as e:
                 print(f"Could not load existing file ({e}). Starting fresh.")
                 master = pd.DataFrame()
+        else:
+            print("Starting fresh (existing file will be overwritten at the end).")
+            delete_old = input("Delete the existing file now for a clean slate? (y/n): ").strip().lower()
+            if delete_old == 'y':
+                try:
+                    os.remove(master_csv_path)
+                    print(f"Deleted existing file: {master_csv_path}")
+                except Exception as e:
+                    print(f"Failed to delete {master_csv_path}: {e}")
+                    print("Continuing anyway — file will be overwritten at the end.")
+            else:
+                print("Keeping existing file. It will be overwritten when the run completes.")
 
     zip_files = sorted(glob.glob(os.path.join(EQUITY_SOURCE_DIR, '*.zip')),
                        key=os.path.basename)
@@ -1728,16 +1741,16 @@ def equities_second():
                     if 'Product name' not in file_headers:
                         return [], None, 0
 
+                    rename_dict = {k: v for k, v in CONSOLIDATE_MAP.items() if k in file_headers}
+                    if rename_dict:
+                        file_headers = [rename_dict.get(h, h) for h in file_headers]
+
                     current_hash = get_schema_hash(file_headers)
                     if ref_schema_hash is None:
                         ref_schema_hash = current_hash
                     elif current_hash != ref_schema_hash:
                         mismatch_count += 1
                         logging.warning(f"Schema mismatch detected in {os.path.basename(zip_path)} (hash: {current_hash})")
-
-                    rename_dict = {k: v for k, v in CONSOLIDATE_MAP.items() if k in file_headers}
-                    if rename_dict:
-                        file_headers = [rename_dict.get(h, h) for h in file_headers]
 
                     product_name_idx = file_headers.index('Product name')
                     last_col_idx = len(file_headers) - 1
@@ -1762,9 +1775,7 @@ def equities_second():
                                 if re.search(fr'\b{re.escape(clean_term)}\b', product_name, re.IGNORECASE):
                                     matching_terms.append(orig_term)
                             else:
-                                # Loose term: ticker at word boundary + any non-space suffix
-                                # → includes basket swap entries like ;GME, ;GME.N, AAPL;GME; etc.
-                                pattern = rf'(?i)\b{re.escape(clean_term)}\b\S*'
+                                pattern = rf'(?i)\b{re.escape(clean_term)}\b(?!\w)'
                                 if row_combined_lower and re.search(pattern, row_combined_lower):
                                     matching_terms.append(orig_term)
 
@@ -1781,6 +1792,8 @@ def equities_second():
             print(f"Error processing {os.path.basename(zip_path)}: {e}")
             return [], None, 0
 
+    all_file_dfs = []
+
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_to_zip = {
             executor.submit(process_zip, zip_files[i]): zip_files[i]
@@ -1793,14 +1806,21 @@ def equities_second():
                 file_matches, headers, count = future.result()
                 if file_matches and headers:
                     file_df = pd.DataFrame(file_matches, columns=headers + ['SearchTerm'])
-                    master = pd.concat([master, file_df], ignore_index=True)
-
-                    master.to_csv(master_csv_path, index=False)
-                    print(f"Processed: {os.path.basename(zip_file)} | Added {count} matches | Total now: {len(master)}")
-                    print(f"   Interim save → {master_csv_path}")
-
+                    all_file_dfs.append(file_df)
+                    total_accumulated = sum(len(df) for df in all_file_dfs)
+                    print(f"Processed: {os.path.basename(zip_file)} | Added {count} matches | Total accumulated so far: {total_accumulated:,}")
+                    
+                    if len(all_file_dfs) % 10 == 0 or total_accumulated > 50000:
+                        interim_master = pd.concat(all_file_dfs, ignore_index=True)
+                        interim_master.to_csv(master_csv_path, index=False)
+                        print(f"   Interim save — cumulative total: {len(interim_master):,} rows → {master_csv_path}")
             except Exception as e:
                 print(f"Exception processing {os.path.basename(zip_file)}: {e}")
+
+    if all_file_dfs:
+        master = pd.concat(all_file_dfs, ignore_index=True)
+    else:
+        master = pd.DataFrame()
 
     if not master.empty:
         master.fillna('', inplace=True)
@@ -1810,15 +1830,76 @@ def equities_second():
             master.sort_values(sort_col, ascending=False, inplace=True)
             master.drop_duplicates(subset=['Dissemination Identifier', 'SearchTerm'], keep='first', inplace=True)
 
+        desired_order = [
+            'Dissemination Identifier',
+            'Original Dissemination Identifier',
+            'Action type',
+            'Event type',
+            'Event timestamp',
+            'Amendment indicator',
+            'Asset Class',
+            'Product name',
+            'Cleared',
+            'Execution Timestamp',
+            'Effective Date',
+            'Expiration Date',
+            'Maturity date of the underlier',
+            'Non-standardized term indicator',
+            'Platform identifier',
+            'Notional amount-Leg 1',
+            'Notional amount-Leg 2',
+            'Notional currency-Leg 1',
+            'Notional currency-Leg 2',
+            'Total notional quantity-Leg 1',
+            'Total notional quantity-Leg 2',
+            'Quantity unit of measure-Leg 1',
+            'Quantity unit of measure-Leg 2',
+            'Price',
+            'Price unit of measure',
+            'Spread-Leg 1',
+            'Spread-Leg 2',
+            'currency pair',
+            'Post-priced swap indicator',
+            'Price currency',
+            'Price notation',
+            'Spread notation-Leg 1',
+            'Floating rate day count convention-leg 1',
+            'Floating rate reset frequency period-leg 1',
+            'Fixed rate payment frequency period-Leg 2',
+            'Fixed rate payment frequency period multiplier-Leg 2',
+            'Other payment type',
+            'Other payment currency',
+            'Settlement currency-Leg 1',
+            'Collateralisation category',
+            'Index factor',
+            'Underlier ID-Leg 1',
+            'Underlier ID-Leg 2',
+            'Underlier ID source-Leg 1',
+            'Underlying Asset Name',
+            'Underlying asset subtype or underlying contract subtype-Leg 1',
+            'Underlying asset subtype or underlying contract subtype-Leg 2',
+            'Embedded Option type',
+            'Option Type',
+            'Option Style',
+            'Delivery Type',
+            'Unique Product Identifier',
+            'UPI FISN',
+            'UPI Underlier Name'
+        ]
+
+        existing_desired = [c for c in desired_order if c in master.columns]
+        extra_cols = [c for c in master.columns if c not in desired_order and c != 'SearchTerm']
+        ordered_cols = existing_desired + extra_cols
+
         if 'SearchTerm' in master.columns:
-            search_col = master.pop('SearchTerm')
-            master = master[sorted(master.columns)]
-            master['SearchTerm'] = search_col
+            ordered_cols.append('SearchTerm')
+
+        master = master[ordered_cols]
 
         master.to_csv(master_csv_path, index=False)
         print(f"\nFinal save complete: {master_csv_path}")
         print(f"Total Unique Matches Found: {len(master)}")
-        print(f"Final output has {len(master.columns)} columns (normalized union).")
+        print(f"Final output has {len(master.columns)} columns (custom order + extras).")
 
         if file_schema_counts:
             schema_summary = Counter(file_schema_counts.values())
@@ -1834,6 +1915,7 @@ def equities_second():
         logging.info(f"Parsing completed. Master file saved as {master_csv_path}")
     else:
         print("No matches found.")
+
 def download_cftc_credit_archives():
     os.makedirs(CFTC_CREDIT_SOURCE_DIR, exist_ok=True)
     gamecat_ascii()
